@@ -1,0 +1,127 @@
+# Plural Star Cloud Node — example configuration
+# Copy to config.yaml and edit, or let the node generate one on first run.
+#
+# PATHS: keypair_path and psk_path resolve against the process working
+# directory. cloud.storage_path and cloud.push_box_key_path resolve against the
+# directory this config file lives in. Relative paths therefore mean different
+# things under systemd (WorkingDirectory=/var/lib/..., config in /etc/...).
+# Use absolute paths on any deployed node.
+
+# Node identity. Ed25519 key, generated on first run if absent (see below).
+keypair_path: "./node.key"
+
+# Set true on a node whose peer ID is already known to the outside world (the
+# public bootstrap node above all: its peer ID is compiled into every shipped
+# app). With this on, a missing keypair file is a fatal error instead of a
+# silently regenerated identity. Leave false on a fresh community node.
+require_existing_identity: false
+
+# Network mode: "public" | "private" | "custom_public"
+network_mode: "public"
+
+# Private network only. 32-byte PSK file, required if network_mode = private.
+psk_path: "./network.psk"
+
+# Custom public network only. Namespacing string, required if network_mode = custom_public.
+network_id: ""
+
+# Bootstrap peers (multiaddr list).
+# Public mode: well-known Plural Star bootstrap nodes are used as fallback if empty.
+# Private / custom_public: at least one peer is required.
+bootstrap_peers: []
+
+# Optional: hosted public-network directory URL (public / custom_public modes).
+# Fetched on startup as a bootstrap for network-card discovery. Leave empty to
+# rely on gossip discovery only, or to use the compiled-in default if one is set.
+directory_url: ""
+
+# API server.
+api_host: "127.0.0.1"   # bind address; use 0.0.0.0 to let the app reach this node over the network
+api_port: 7523
+# api_token gates EVERY endpoint, including the ones apps use (/send, /ws,
+# /rendezvous/*). Apps on the default public network have no token, so a value
+# here does not harden a public node, it shuts the whole network out. Public
+# nodes therefore ignore it: the value is stripped and rewritten to "" on load.
+# Set it only on private / custom_public networks.
+api_token: ""
+
+# libp2p listen addresses.
+listen_addrs:
+  - "/ip4/0.0.0.0/tcp/4001"
+  - "/ip4/0.0.0.0/udp/4001/quic-v1"
+
+# Optional: announce external address if behind static NAT.
+announce_addrs: []
+
+# Whether this node forwards traffic for others.
+relay_enabled: true
+
+# Connection limits.
+max_peers: 200
+max_app_connections: 5000
+
+# Cloud services. Off by default: a plain relay never touches any of this.
+# When enabled the node advertises roles [relay, cloud], serves /cloud/*, and
+# holds packets for offline peers on disk instead of in memory.
+cloud:
+  enabled: false
+
+  # Root for vaults/, objects/, inbox/, front/, push/. Relative to this file's
+  # directory. Vault data can reach terabytes: on a deployed node put this on
+  # the data volume, not next to the config.
+  storage_path: "./cloud"
+
+  # Where media-tier objects live: "local" | "remote" | "s3". Base-tier objects
+  # always stay local so a restore never depends on a second machine.
+  media_backend: "local"
+
+  # media_backend = remote: a second instance of this binary serving only its
+  # blob store, reached over HTTP with a shared secret.
+  remote_blob_url: ""
+  remote_blob_secret: ""
+
+  # Set ONLY on a node that serves its blob store to another node. Registers
+  # /cloud/blob behind this bearer token. Leave empty otherwise.
+  blob_serve_secret: ""
+
+  # media_backend = s3: any S3-compatible bucket.
+  s3_endpoint: ""
+  s3_region: "us-east-1"
+  s3_bucket: ""
+  s3_prefix: ""
+  s3_access_key: ""
+  s3_secret_key: ""
+
+  # Writes are refused (507) once disk use reaches this percentage.
+  watermark_percent: 90
+
+  # Per-vault quotas and object limits.
+  base_quota_mb: 200
+  media_quota_mb: 1024
+  object_max_mb: 25
+  manifest_versions: 30
+
+  # Store-and-forward inbox: per-recipient retention and size.
+  inbox_ttl_days: 30
+  inbox_quota_mb: 50
+
+  # Days a vault with zero linked devices survives before deletion.
+  grace_days: 30
+
+  # Hour (UTC) the daily garbage collection runs.
+  gc_hour_utc: 4
+
+  # Push relay. The node accepts push registrations and events (sealed to its
+  # box key or plain), queues them, and forwards them unchanged to the push
+  # gateway at this URL, which does the APNs delivery. Empty disables the
+  # relay and /cloud/push/* answers 503. On the production shard the gateway
+  # runs on the same box: "http://127.0.0.1:7524". push_forward_token is sent
+  # as a bearer token and must match the gateway's api_token, if it has one.
+  push_forward_url: ""
+  push_forward_token: ""
+
+  # X25519 key the node publishes so other nodes can seal push requests to it.
+  # Generated on first run if absent, 0600. Relative to this file's directory.
+  # Back it up once created: a regenerated key orphans anything sealed to the
+  # old one.
+  push_box_key_path: "./push.key"

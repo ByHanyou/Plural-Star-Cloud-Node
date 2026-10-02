@@ -1,0 +1,33 @@
+[Unit]
+Description=Plural Star Push Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# One directory holds gateway.yaml, the APNs .p8 and gateway-data.json, and it
+# is also the working directory: apns_key_path resolves against the working
+# directory and data_path against the config file's directory, so keeping
+# them the same place lets gateway.yaml stay exactly as it is on the
+# residential machine, relative paths and all.
+ExecStart=/usr/local/bin/plural-star-gateway --config /var/lib/plural-star-gateway/gateway.yaml
+Restart=on-failure
+RestartSec=5s
+User=plural-star
+WorkingDirectory=/var/lib/plural-star-gateway
+Environment=GOMEMLIMIT=256MiB
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/plural-star-gateway
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

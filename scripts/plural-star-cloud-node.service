@@ -1,0 +1,28 @@
+[Unit]
+Description=Plural Star Cloud Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/plural-star-cloud-node --config /etc/plural-star-cloud-node/config.yaml
+Restart=on-failure
+RestartSec=5s
+User=plural-star
+WorkingDirectory=/var/lib/plural-star-cloud-node
+Environment=GOMEMLIMIT=2500MiB
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/plural-star-cloud-node /etc/plural-star-cloud-node
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

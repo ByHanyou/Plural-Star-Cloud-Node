@@ -99,9 +99,7 @@ func (p *Presence) readLoop() {
 		if err != nil {
 			continue
 		}
-		// The route goes to the node that signed the gossip message, whatever the
-		// body claims: a via_node field chosen by the sender let any mesh node
-		// point every app's traffic at an arbitrary peer.
+		// The route goes to the node that signed the message, not to the via_node the body claims.
 		via := msg.GetFrom()
 		if via == "" {
 			continue

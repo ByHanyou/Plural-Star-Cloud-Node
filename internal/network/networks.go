@@ -70,9 +70,7 @@ func (nd *NetworkDiscovery) readLoop() {
 		if found && card.CreatedAt <= existing.CreatedAt {
 			continue
 		}
-		// A card id belongs to the key that first published it. Without this any
-		// node could re-sign a known id with its own key and a newer created_at
-		// and every node would store, re-publish and serve the hijacked card.
+		// A card id belongs to the key that first published it.
 		if found && card.CreatedBy != existing.CreatedBy {
 			continue
 		}

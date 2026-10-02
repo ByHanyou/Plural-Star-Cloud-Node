@@ -25,11 +25,8 @@ func (s *Server) authed(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// originAllowed rejects requests a web page makes cross-site. The apps never
-// send an Origin header (React Native) or send a non-http one (Electron's
-// file:// renderer sends "null"); a browser tab on another site always sends
-// its http(s) origin, and with it could open the WebSocket or post to /send
-// against an operator's loopback-bound node.
+// originAllowed rejects cross-site requests from a browser page; the apps send
+// no Origin header or a non-http one.
 func originAllowed(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" || origin == "null" {
@@ -73,11 +70,8 @@ func (s *Server) checkAuth(r *http.Request) bool {
 }
 
 // operatorOnly guards the endpoints that read or rewrite the node's own
-// configuration. When api_token is set, authed has already identified the
-// operator by bearer token. Without one (config.Load strips the token on every
-// public node) only the local machine may call them, and when the call carries
-// a body it must be declared as JSON so a browser cannot submit it cross-site
-// without a CORS preflight, which this server never answers.
+// configuration: the bearer token when api_token is set, otherwise loopback
+// only, and any body must be declared as JSON.
 func (s *Server) operatorOnly(w http.ResponseWriter, r *http.Request, requireJSON bool) bool {
 	if requireJSON {
 		ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))

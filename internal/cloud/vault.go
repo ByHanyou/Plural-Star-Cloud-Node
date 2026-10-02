@@ -241,8 +241,7 @@ func (v *vaultStore) usage(id string, m *vaultMeta) (map[string]int64, map[strin
 	for _, r := range known {
 		use[r.Tier] += r.Size
 	}
-	// The manifest ciphertext lives in the vault too; count the current one
-	// so it cannot grow outside the quota.
+	// The current manifest counts against the quota too.
 	if m.Version > 0 {
 		if st, serr := os.Stat(filepath.Join(v.path(id), "manifest."+strconv.FormatInt(m.Version, 10))); serr == nil {
 			use[TierBase] += st.Size()
@@ -562,9 +561,8 @@ func (v *vaultStore) Delete(id string) error {
 // liveObjects returns every object ID referenced by any kept manifest version
 // or pending in any vault, plus the vaults whose grace period has elapsed.
 //
-// Any metadata that cannot be read is an error, never an empty vault: the
-// caller deletes every object not in live, from S3 as well as the local store,
-// so skipping a vault here would destroy that user's backup.
+// Unreadable metadata is an error, never an empty vault: the caller deletes
+// every object not in live.
 func (v *vaultStore) liveObjects(graceCutoff time.Time) (live map[string]struct{}, expiredVaults []string, err error) {
 	live = make(map[string]struct{})
 	for _, id := range v.ids() {
@@ -573,8 +571,7 @@ func (v *vaultStore) liveObjects(graceCutoff time.Time) (live map[string]struct{
 		if rerr != nil {
 			unlock()
 			if errors.Is(rerr, ErrVaultMissing) {
-				// A directory with no vault.json is a create that died halfway;
-				// nothing was ever committed to it.
+				// A directory without vault.json is a create that died halfway.
 				continue
 			}
 			return nil, nil, rerr

@@ -85,8 +85,7 @@ func (pm *PeerMemory) Snapshot(h host.Host) {
 		if id == h.ID() {
 			continue
 		}
-		// An inbound connection's remote address is an ephemeral source port; it
-		// is never dialable and would fill the memory with dead entries.
+		// An inbound remote address is an ephemeral source port and never dialable.
 		if c.Stat().Direction != corenet.DirOutbound {
 			continue
 		}

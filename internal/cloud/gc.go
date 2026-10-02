@@ -21,8 +21,7 @@ const (
 func (s *Service) runGC() {
 	start := time.Now()
 	graceCutoff := start.Add(-time.Duration(s.cfg.GraceDays) * 24 * time.Hour)
-	// Upload fragments, inbox packets and idle locks are safe to sweep whatever
-	// happens to the object pass below.
+	// These sweeps run even when the object pass below aborts.
 	defer func() {
 		s.objects.sweepParts(gcObjectGrace)
 		s.inbox.sweep()
@@ -31,9 +30,8 @@ func (s *Service) runGC() {
 	}()
 	live, expired, err := s.vaults.liveObjects(graceCutoff)
 	if err != nil {
-		// An unreadable vault.json or refs file must not make that vault's
-		// objects look unreferenced: they would be deleted from the local store
-		// and from S3. Collect nothing until every vault reads cleanly.
+		// Collect nothing until every vault reads cleanly, or an unreadable vault's
+		// objects would be deleted as unreferenced.
 		log.Printf("gc: object collection skipped: %v", err)
 		return
 	}

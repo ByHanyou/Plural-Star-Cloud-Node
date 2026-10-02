@@ -156,8 +156,6 @@ func NewDHT(ctx context.Context, h host.Host, prefix string) (*dht.IpfsDHT, erro
 // how many NEW connections were made. Skipping live connections keeps the
 // reconnect loop's count honest and its log quiet while the mesh is healthy.
 func ConnectPeers(ctx context.Context, h host.Host, infos []peer.AddrInfo) (int, error) {
-	// Dials run a few at a time: sequential 30 s timeouts over the bootstrap list
-	// plus up to 64 remembered peers could block a reconnect tick for half an hour.
 	var (
 		mu        sync.Mutex
 		wg        sync.WaitGroup

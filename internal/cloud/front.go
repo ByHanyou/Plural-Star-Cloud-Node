@@ -59,8 +59,7 @@ func (f *frontStore) Get(peerID string) (FrontEntry, bool) {
 	return e, true
 }
 
-// sweep removes entries nobody has refreshed for maxAge; the cache holds the
-// author's fronters in plaintext and should not outlive the account it served.
+// sweep removes entries nobody has refreshed for maxAge.
 func (f *frontStore) sweep(maxAge time.Duration) int {
 	entries, err := os.ReadDir(f.dir)
 	if err != nil {

@@ -15,8 +15,7 @@ const (
 	wsPongWait   = 60 * time.Second
 	wsPingPeriod = 50 * time.Second
 	wsSendBuffer = 64
-	// wsMaxMessage bounds a frame from the app; the socket only carries pongs and
-	// small control messages inbound.
+	// wsMaxMessage bounds an inbound frame from the app.
 	wsMaxMessage = 64 << 10
 )
 

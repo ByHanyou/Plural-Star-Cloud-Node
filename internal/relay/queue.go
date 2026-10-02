@@ -17,9 +17,7 @@ const (
 	QueueMaxSenders = 500
 	// QueueMaxRecipients caps how many recipients may have packets waiting at once.
 	QueueMaxRecipients = 10000
-	// QueueMaxBytes caps the memory held by the whole queue. /send is open to
-	// the internet with caller-chosen sender and recipient ids, so a per-recipient
-	// cap alone leaves RAM exhaustion one loop away.
+	// QueueMaxBytes caps the memory held by the whole queue.
 	QueueMaxBytes = 64 << 20
 	// QueueSweepInterval is how often expired entries are pruned.
 	QueueSweepInterval = 30 * time.Minute

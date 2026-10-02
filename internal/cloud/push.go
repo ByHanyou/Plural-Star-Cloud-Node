@@ -240,8 +240,7 @@ func (p *pushRelay) drain() bool {
 			_ = os.Remove(path)
 			continue
 		}
-		// The gateway answered but refused this one for now (5xx); leave it for
-		// the next pass and carry on so it cannot block everything behind it.
+		// A 5xx leaves this packet for the next pass without blocking the rest.
 		allDone = false
 	}
 	return allDone

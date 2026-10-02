@@ -36,9 +36,7 @@ type rendezvousStore struct {
 	path    string
 	fileMu  sync.Mutex
 
-	// persistTimer coalesces writes: every put used to serialise the whole
-	// store (up to 20,000 × 8 KB) and rewrite the file synchronously, so a
-	// burst of registrations was a burst of multi-megabyte writes.
+	// persistTimer coalesces store writes.
 	persistTimer *time.Timer
 }
 
@@ -163,9 +161,7 @@ func (rs *rendezvousStore) putRemote(namespace, record string, ttl time.Duration
 	expiresAt := time.Now().Add(ttl)
 	rs.mu.Lock()
 	cur, exists := rs.entries[namespace]
-	// A record registered on this node by its own app is authoritative here:
-	// gossip from another node must not be able to replace it, or any node
-	// could break pairing for every namespace it has seen.
+	// A record registered here by its own app is authoritative; gossip may not replace it.
 	if exists && (cur.local || !cur.expiresAt.Before(expiresAt)) {
 		rs.mu.Unlock()
 		return

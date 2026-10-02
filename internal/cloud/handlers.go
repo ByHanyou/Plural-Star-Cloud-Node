@@ -203,8 +203,7 @@ func (s *Service) handleVaultCreate(w http.ResponseWriter, r *http.Request) {
 	if s.watermarked(w) {
 		return
 	}
-	// Creation is open to anyone with a fresh lookup id, so it counts against
-	// the per-address window like a lookup does.
+	// Creation counts against the per-address window like a lookup.
 	s.limiter.record(clientIP(r), c.LookupID)
 	if err := s.vaults.Create(c.LookupID, c.AuthSecret, body.WrappedMasterKey); err != nil {
 		s.vaultError(w, r, c.LookupID, err)

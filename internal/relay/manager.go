@@ -93,8 +93,7 @@ func (m *Manager) SetOffline(f OfflineFunc) {
 }
 
 // SetOfflineReplay installs the drain for the persistent store, used when a
-// recipient comes online through another node. Without it packets parked on
-// disk waited for the app to connect to this node in particular.
+// recipient comes online through another node.
 func (m *Manager) SetOfflineReplay(f OfflineReplayFunc) {
 	m.offlineMu.Lock()
 	m.replay = f

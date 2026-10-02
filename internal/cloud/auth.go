@@ -92,9 +92,7 @@ func (h identityHeaders) verify(signed string) bool {
 	return freshTS(h.TS) && verifySigned(h.PeerID, h.Pub, h.Sig, signed) && !replays.seenOrAdd(h.Sig)
 }
 
-// replayCache remembers accepted signatures for the freshness window. Without
-// it a captured /cloud/inbox request could be replayed for ten minutes and
-// drain the victim's packets onto the attacker's socket.
+// replayCache remembers accepted signatures for the freshness window.
 type replayCache struct {
 	mu   sync.Mutex
 	seen map[string]time.Time
@@ -139,9 +137,7 @@ func clientIP(r *http.Request) string {
 	if err != nil {
 		host = r.RemoteAddr
 	}
-	// Behind a reverse proxy on the same machine every request arrives from
-	// loopback; the real address is the first X-Forwarded-For hop. Only a
-	// loopback peer is trusted to set it, so a remote client cannot pick its own.
+	// Only a loopback peer, a reverse proxy on this machine, may set X-Forwarded-For.
 	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			if first := strings.TrimSpace(strings.Split(xff, ",")[0]); first != "" {

@@ -281,7 +281,6 @@ func persistentReconnectLoop(ctx context.Context, h host.Host, bootstrapInfos []
 }
 
 func monitorConnections(ctx context.Context, h host.Host) {
-	// Once a minute is plenty for a line that only states the connection count.
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for {

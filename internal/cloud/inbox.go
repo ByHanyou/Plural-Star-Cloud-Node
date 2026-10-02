@@ -30,8 +30,7 @@ type Inbox struct {
 	mu    sync.Mutex
 	locks map[peer.ID]*sync.Mutex
 
-	// full reports whether the disk is at the watermark; Store refuses new
-	// packets while it is, like every other write path.
+	// full reports whether the disk is at the watermark.
 	full func() bool
 
 	// Live packet count for /health. It used to be computed by walking every

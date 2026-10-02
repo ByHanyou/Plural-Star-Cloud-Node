@@ -25,9 +25,22 @@ func (s *Server) authed(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// originAllowed rejects cross-site requests from a browser page; the apps send
-// no Origin header or a non-http one.
 func originAllowed(r *http.Request) bool {
+	if originLocal(r) {
+		return true
+	}
+	u, err := url.Parse(r.Header.Get("Origin"))
+	if err != nil || u.Hostname() == "" {
+		return false
+	}
+	reqHost := r.Host
+	if h, _, err := net.SplitHostPort(reqHost); err == nil {
+		reqHost = h
+	}
+	return strings.EqualFold(u.Hostname(), strings.Trim(reqHost, "[]"))
+}
+
+func originLocal(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" || origin == "null" {
 		return true
@@ -69,10 +82,11 @@ func (s *Server) checkAuth(r *http.Request) bool {
 	return false
 }
 
-// operatorOnly guards the endpoints that read or rewrite the node's own
-// configuration: the bearer token when api_token is set, otherwise loopback
-// only, and any body must be declared as JSON.
 func (s *Server) operatorOnly(w http.ResponseWriter, r *http.Request, requireJSON bool) bool {
+	if !originLocal(r) {
+		writeError(w, http.StatusForbidden, "cross-site requests are not accepted")
+		return false
+	}
 	if requireJSON {
 		ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
 		if ct != "application/json" {

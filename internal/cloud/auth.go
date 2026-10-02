@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	lpcrypto "github.com/libp2p/go-libp2p/core/crypto"
@@ -88,7 +89,35 @@ func readIdentityHeaders(r *http.Request) (identityHeaders, bool) {
 }
 
 func (h identityHeaders) verify(signed string) bool {
-	return freshTS(h.TS) && verifySigned(h.PeerID, h.Pub, h.Sig, signed)
+	return freshTS(h.TS) && verifySigned(h.PeerID, h.Pub, h.Sig, signed) && !replays.seenOrAdd(h.Sig)
+}
+
+// replayCache remembers accepted signatures for the freshness window. Without
+// it a captured /cloud/inbox request could be replayed for ten minutes and
+// drain the victim's packets onto the attacker's socket.
+type replayCache struct {
+	mu   sync.Mutex
+	seen map[string]time.Time
+}
+
+var replays = &replayCache{seen: make(map[string]time.Time)}
+
+func (c *replayCache) seenOrAdd(sig string) bool {
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.seen) > 4096 {
+		for k, t := range c.seen {
+			if now.Sub(t) > 2*tsSkew {
+				delete(c.seen, k)
+			}
+		}
+	}
+	if t, ok := c.seen[sig]; ok && now.Sub(t) <= 2*tsSkew {
+		return true
+	}
+	c.seen[sig] = now
+	return false
 }
 
 func hashSecret(secretHex string) string {
@@ -108,7 +137,17 @@ func secretMatches(storedHash, secretHex string) bool {
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	// Behind a reverse proxy on the same machine every request arrives from
+	// loopback; the real address is the first X-Forwarded-For hop. Only a
+	// loopback peer is trusted to set it, so a remote client cannot pick its own.
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if first := strings.TrimSpace(strings.Split(xff, ",")[0]); first != "" {
+				return first
+			}
+		}
 	}
 	return host
 }

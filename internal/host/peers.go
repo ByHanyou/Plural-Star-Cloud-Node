@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/host"
+	corenet "github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	ma "github.com/multiformats/go-multiaddr"
 )
@@ -28,10 +29,10 @@ import (
 // This is purely local dial-target state. Nothing here changes the wire
 // protocol, adds a message, or shares new data with anyone.
 const (
-	peerMemoryMaxPeers     = 64
-	peerMemoryMaxAddrs     = 8
-	peerMemoryTTL          = 30 * 24 * time.Hour
-	peerMemoryFilePerms    = 0o600
+	peerMemoryMaxPeers  = 64
+	peerMemoryMaxAddrs  = 8
+	peerMemoryTTL       = 30 * 24 * time.Hour
+	peerMemoryFilePerms = 0o600
 )
 
 type rememberedPeer struct {
@@ -82,6 +83,11 @@ func (pm *PeerMemory) Snapshot(h host.Host) {
 	for _, c := range h.Network().Conns() {
 		id := c.RemotePeer()
 		if id == h.ID() {
+			continue
+		}
+		// An inbound connection's remote address is an ephemeral source port; it
+		// is never dialable and would fill the memory with dead entries.
+		if c.Stat().Direction != corenet.DirOutbound {
 			continue
 		}
 		addr := c.RemoteMultiaddr()

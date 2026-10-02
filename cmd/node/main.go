@@ -29,15 +29,15 @@ import (
 )
 
 type node struct {
-	cfg   *config.Config
-	h     host.Host
-	dht   *dht.IpfsDHT
-	ps    *pubsub.PubSub
-	rd    *drouting.RoutingDiscovery
-	relay *relay.Manager
-	ping  *ping.Manager
-	api   *api.Server
-	cloud *cloud.Service
+	cfg      *config.Config
+	h        host.Host
+	dht      *dht.IpfsDHT
+	ps       *pubsub.PubSub
+	rd       *drouting.RoutingDiscovery
+	relay    *relay.Manager
+	ping     *ping.Manager
+	api      *api.Server
+	cloud    *cloud.Service
 	networks *network.Store
 }
 
@@ -167,6 +167,7 @@ func run(configPath string) error {
 	if n.cloud != nil {
 		srv.SetCloud(n.cloud)
 		mgr.SetOffline(n.cloud.Inbox().Store)
+		mgr.SetOfflineReplay(n.cloud.Inbox().Replay)
 		log.Printf("cloud services attached, roles %v", cfg.Roles())
 	}
 
@@ -199,7 +200,7 @@ func run(configPath string) error {
 
 	go func() {
 		if err := srv.Start(); err != nil {
-			log.Printf("API server error: %v", err)
+			log.Fatalf("API server error: %v", err)
 		}
 	}()
 	defer func() {
@@ -280,7 +281,8 @@ func persistentReconnectLoop(ctx context.Context, h host.Host, bootstrapInfos []
 }
 
 func monitorConnections(ctx context.Context, h host.Host) {
-	ticker := time.NewTicker(30 * time.Second)
+	// Once a minute is plenty for a line that only states the connection count.
+	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for {
 		select {

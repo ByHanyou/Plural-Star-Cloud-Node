@@ -139,8 +139,8 @@ func (s *Service) vaultError(w http.ResponseWriter, r *http.Request, lookupID st
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "manifest references missing objects", "missing": merr.IDs})
 	case errors.Is(err, ErrQuota):
 		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
-			"error":            "vault quota exceeded",
-			"base_quota_bytes": int64(s.cfg.BaseQuotaMB) << 20,
+			"error":             "vault quota exceeded",
+			"base_quota_bytes":  int64(s.cfg.BaseQuotaMB) << 20,
 			"media_quota_bytes": int64(s.cfg.MediaQuotaMB) << 20,
 		})
 	case errors.Is(err, ErrTooLarge):
@@ -203,6 +203,9 @@ func (s *Service) handleVaultCreate(w http.ResponseWriter, r *http.Request) {
 	if s.watermarked(w) {
 		return
 	}
+	// Creation is open to anyone with a fresh lookup id, so it counts against
+	// the per-address window like a lookup does.
+	s.limiter.record(clientIP(r), c.LookupID)
 	if err := s.vaults.Create(c.LookupID, c.AuthSecret, body.WrappedMasterKey); err != nil {
 		s.vaultError(w, r, c.LookupID, err)
 		return
@@ -649,10 +652,14 @@ func (s *Service) handleFrontPut(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "stale timestamp")
 		return
 	}
-	signed := fmt.Sprintf("psgw-front|%s|%d|%s|%d|%s|%s|%s|%s|%s",
+	signedRead := fmt.Sprintf("psgw-front|%s|%d|%s|%d|%s|%s|%s|%s|%s",
 		req.PeerID, req.TS, req.Fronters, req.StartTime, req.Name,
 		req.Primary, req.CoFront, req.CoConscious, strings.Join(req.Readers, ","))
-	if !verifySigned(req.PeerID, req.EdPub, req.Sig, signed) {
+	signedNew := fmt.Sprintf("psgw-front|%s|%d|%s|%d|%s", req.PeerID, req.TS, req.Fronters, req.StartTime, req.Name)
+	signedOld := fmt.Sprintf("psgw-front|%s|%d|%s|%d", req.PeerID, req.TS, req.Fronters, req.StartTime)
+	if !verifySigned(req.PeerID, req.EdPub, req.Sig, signedRead) &&
+		!verifySigned(req.PeerID, req.EdPub, req.Sig, signedNew) &&
+		!verifySigned(req.PeerID, req.EdPub, req.Sig, signedOld) {
 		writeError(w, http.StatusUnauthorized, "bad signature")
 		return
 	}

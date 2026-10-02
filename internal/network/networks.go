@@ -38,16 +38,6 @@ func NewNetworkDiscovery(ctx context.Context, ps *pubsub.PubSub, self peer.ID, s
 	return nd, nil
 }
 
-func (nd *NetworkDiscovery) Announce(card NetworkCard) error {
-	if err := VerifyNetworkCard(&card); err != nil {
-		return err
-	}
-	if err := nd.store.Put(card); err != nil {
-		return err
-	}
-	return nd.publish(card)
-}
-
 func (nd *NetworkDiscovery) publish(card NetworkCard) error {
 	b, err := json.Marshal(card)
 	if err != nil {
@@ -78,6 +68,12 @@ func (nd *NetworkDiscovery) readLoop() {
 			continue
 		}
 		if found && card.CreatedAt <= existing.CreatedAt {
+			continue
+		}
+		// A card id belongs to the key that first published it. Without this any
+		// node could re-sign a known id with its own key and a newer created_at
+		// and every node would store, re-publish and serve the hijacked card.
+		if found && card.CreatedBy != existing.CreatedBy {
 			continue
 		}
 		if err := nd.store.Put(card); err != nil {

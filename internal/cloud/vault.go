@@ -241,6 +241,13 @@ func (v *vaultStore) usage(id string, m *vaultMeta) (map[string]int64, map[strin
 	for _, r := range known {
 		use[r.Tier] += r.Size
 	}
+	// The manifest ciphertext lives in the vault too; count the current one
+	// so it cannot grow outside the quota.
+	if m.Version > 0 {
+		if st, serr := os.Stat(filepath.Join(v.path(id), "manifest."+strconv.FormatInt(m.Version, 10))); serr == nil {
+			use[TierBase] += st.Size()
+		}
+	}
 	return use, known, nil
 }
 
@@ -396,6 +403,7 @@ func (v *vaultStore) PutManifest(id, secret string, expected int64, ciphertext [
 	if len(missing) > 0 {
 		return m.Version, &missingError{IDs: missing}
 	}
+	use[TierBase] += int64(len(ciphertext))
 	for tier, used := range use {
 		if used > v.quota(tier) {
 			return m.Version, ErrQuota
@@ -553,16 +561,31 @@ func (v *vaultStore) Delete(id string) error {
 
 // liveObjects returns every object ID referenced by any kept manifest version
 // or pending in any vault, plus the vaults whose grace period has elapsed.
-func (v *vaultStore) liveObjects(graceCutoff time.Time) (live map[string]struct{}, expiredVaults []string) {
+//
+// Any metadata that cannot be read is an error, never an empty vault: the
+// caller deletes every object not in live, from S3 as well as the local store,
+// so skipping a vault here would destroy that user's backup.
+func (v *vaultStore) liveObjects(graceCutoff time.Time) (live map[string]struct{}, expiredVaults []string, err error) {
 	live = make(map[string]struct{})
 	for _, id := range v.ids() {
 		unlock := v.lock(id)
-		m, err := v.readMeta(id)
-		if err != nil {
+		m, rerr := v.readMeta(id)
+		if rerr != nil {
 			unlock()
-			continue
+			if errors.Is(rerr, ErrVaultMissing) {
+				// A directory with no vault.json is a create that died halfway;
+				// nothing was ever committed to it.
+				continue
+			}
+			return nil, nil, rerr
 		}
-		if m.GraceStartedAt > 0 && len(m.Devices) == 0 && time.UnixMilli(m.GraceStartedAt).Before(graceCutoff) {
+		// A vault with no linked device expires GraceDays after the unlink that
+		// emptied it, or, when nothing was ever linked, after its last write.
+		graceStart := m.GraceStartedAt
+		if graceStart == 0 {
+			graceStart = m.Updated
+		}
+		if len(m.Devices) == 0 && graceStart > 0 && time.UnixMilli(graceStart).Before(graceCutoff) {
 			expiredVaults = append(expiredVaults, id)
 			unlock()
 			continue
@@ -571,9 +594,10 @@ func (v *vaultStore) liveObjects(graceCutoff time.Time) (live map[string]struct{
 			live[r.ID] = struct{}{}
 		}
 		for _, ver := range v.keptVersions(id) {
-			refs, err := v.refs(id, ver)
-			if err != nil {
-				continue
+			refs, rerr := v.refs(id, ver)
+			if rerr != nil {
+				unlock()
+				return nil, nil, fmt.Errorf("vault %s manifest %d refs: %w", id, ver, rerr)
 			}
 			for _, r := range refs {
 				live[r.ID] = struct{}{}
@@ -581,5 +605,5 @@ func (v *vaultStore) liveObjects(graceCutoff time.Time) (live map[string]struct{
 		}
 		unlock()
 	}
-	return live, expiredVaults
+	return live, expiredVaults, nil
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 const DiscoveryTopic = "plural-star:discovery:networks"
@@ -49,6 +50,17 @@ func SignNetworkCard(c *NetworkCard, priv crypto.PrivKey) error {
 }
 
 func VerifyNetworkCard(c *NetworkCard) error {
+	if c.ID == "" {
+		return errors.New("card has no id")
+	}
+	if c.CreatedAt <= 0 {
+		return errors.New("card has no created_at")
+	}
+	for _, a := range c.BootstrapPeers {
+		if _, err := ma.NewMultiaddr(a); err != nil {
+			return fmt.Errorf("invalid bootstrap peer %q: %w", a, err)
+		}
+	}
 	if c.Signature == "" {
 		return errors.New("card has no signature")
 	}

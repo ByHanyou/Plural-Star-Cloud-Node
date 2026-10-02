@@ -176,9 +176,9 @@ When `api_token` is set, all endpoints require `Authorization: Bearer <api_token
 | GET | `/peers` | Known online app peers (from the routing table) |
 | GET | `/networks` | Known public networks (from the discovery cache) |
 | POST | `/send` | Send a packet: `{recipient_peer_id, payload(base64), packet_id?}` → `{status:"queued", packet_id}` (best-effort). Reuse the returned `packet_id` when sending the same packet through other nodes so duplicates are deduped end-to-end |
-| POST | `/invite/generate` | Generate a private-network invite (private mode only) |
-| POST | `/invite/accept` | Accept an invite; writes PSK + bootstrap, requires restart |
-| GET | `/config` | Current config (API token redacted) |
+| POST | `/invite/generate` | Generate a private-network invite (private mode only). Operator only: needs the `api_token`, or a caller on the local machine when none is set |
+| POST | `/invite/accept` | Accept an invite; writes PSK + bootstrap, requires restart. Operator only (as above) and the body must be sent as `application/json` |
+| GET | `/config` | Current config (secrets redacted). Operator only (as above) |
 | POST | `/rendezvous/register` | Publish a signed, short-lived pairing record under a namespace |
 | GET | `/rendezvous/lookup` | Look up pairing records: `?namespace=<ns>` |
 | GET | `/ws` | WebSocket; pass `?peer_id=<app peer id>` to register |
@@ -194,15 +194,14 @@ With the cloud role on, `/cloud/*` is added: `vault/lookup`, `vault/create`, `va
 A hardened unit is in `scripts/plural-star-cloud-node.service`. It runs as user `plural-star`, reads `/etc/plural-star-cloud-node/config.yaml`, works in `/var/lib/plural-star-cloud-node`, and sets `GOMEMLIMIT=2500MiB`.
 
 ```sh
-sudo useradd --system --home /var/lib/plural-star-cloud-node plural-star
+sudo useradd --system --home-dir /var/lib/plural-star-cloud-node --shell /usr/sbin/nologin plural-star
 sudo install -Dm755 plural-star-cloud-node /usr/local/bin/plural-star-cloud-node
 sudo install -Dm644 scripts/plural-star-cloud-node.service /etc/systemd/system/plural-star-cloud-node.service
-sudo mkdir -p /etc/plural-star-cloud-node /var/lib/plural-star-cloud-node
-sudo chown plural-star:plural-star /var/lib/plural-star-cloud-node
+sudo install -d -o plural-star -g plural-star -m 750 /etc/plural-star-cloud-node /var/lib/plural-star-cloud-node
 sudo systemctl enable --now plural-star-cloud-node
 ```
 
-Put `config.yaml`, `node.key`, and `network.psk` in `/etc/plural-star-cloud-node/`, owned by `plural-star`, and use absolute paths in the config.
+Both directories must be owned by `plural-star`: the first start writes `config.yaml` next to the config path, and `node.key`, `network.psk`, `known_peers.json`, `rendezvous.json`, the cloud storage root and `push.key` resolve relative to it unless the config uses absolute paths. Put `config.yaml`, `node.key`, and `network.psk` in `/etc/plural-star-cloud-node/`, owned by `plural-star`, and use absolute paths in the config.
 
 ### Windows
 

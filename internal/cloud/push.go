@@ -212,6 +212,7 @@ func (p *pushRelay) drain() bool {
 		}
 	}
 	sort.Strings(names)
+	allDone := true
 	for _, name := range names {
 		path := filepath.Join(p.queueDir, name)
 		raw, err := os.ReadFile(path)
@@ -237,9 +238,13 @@ func (p *pushRelay) drain() bool {
 		}
 		if done {
 			_ = os.Remove(path)
+			continue
 		}
+		// The gateway answered but refused this one for now (5xx); leave it for
+		// the next pass and carry on so it cannot block everything behind it.
+		allDone = false
 	}
-	return true
+	return allDone
 }
 
 func (p *pushRelay) forward(item pushItem) (reachable bool, done bool) {
@@ -265,7 +270,7 @@ func (p *pushRelay) forward(item pushItem) (reachable bool, done bool) {
 	_ = resp.Body.Close()
 	if resp.StatusCode >= 500 {
 		log.Printf("push relay: gateway returned %d for %s, retrying", resp.StatusCode, item.Kind)
-		return false, false
+		return true, false
 	}
 	if resp.StatusCode >= 400 {
 		log.Printf("push relay: gateway rejected %s with %d, dropped", item.Kind, resp.StatusCode)

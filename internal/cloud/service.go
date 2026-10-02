@@ -53,6 +53,7 @@ func New(ctx context.Context, cfg config.CloudConfig, configDir string) (*Servic
 	s.objects = newObjectStore(root, s.media, cfg)
 	s.vaults = newVaultStore(root, cfg, s.objects)
 	s.inbox = newInbox(filepath.Join(root, "inbox"), cfg)
+	s.inbox.full = s.atWatermark
 	s.fronts = newFrontStore(filepath.Join(root, "front"))
 	pushKeyPath := cfg.PushBoxKeyPath
 	if pushKeyPath == "" {

@@ -45,8 +45,12 @@ func TestValidateNetworkModes(t *testing.T) {
 			t.Fatal("custom_public without network_id should fail")
 		}
 		c.NetworkID = "my-net"
+		if err := c.Validate(); err == nil {
+			t.Fatal("custom_public without bootstrap_peers should fail")
+		}
+		c.BootstrapPeers = []string{"/ip4/203.0.113.1/tcp/4001/p2p/12D3KooWBootstrapPeerPlaceholder"}
 		if err := c.Validate(); err != nil {
-			t.Fatalf("custom_public with network_id should be valid: %v", err)
+			t.Fatalf("custom_public with network_id and bootstrap_peers should be valid: %v", err)
 		}
 	})
 

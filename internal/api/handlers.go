@@ -111,7 +111,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		SenderID  string `json:"sender_peer_id,omitempty"`
 		Recipient string `json:"recipient_peer_id"`
 		Payload   string `json:"payload"`
-		PacketID string `json:"packet_id,omitempty"`
+		PacketID  string `json:"packet_id,omitempty"`
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -187,8 +187,21 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.operatorOnly(w, r, false) {
+		return
+	}
 	redacted := *s.cfg
-	redacted.APIToken = "***redacted***"
+	redact := func(v *string) {
+		if *v != "" {
+			*v = "***redacted***"
+		}
+	}
+	redact(&redacted.APIToken)
+	redact(&redacted.Cloud.RemoteBlobSecret)
+	redact(&redacted.Cloud.BlobServeSecret)
+	redact(&redacted.Cloud.S3AccessKey)
+	redact(&redacted.Cloud.S3SecretKey)
+	redact(&redacted.Cloud.PushForwardToken)
 	writeJSON(w, http.StatusOK, redacted)
 }
 
@@ -274,6 +287,9 @@ func (s *Server) handleInviteGenerate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
 		return
 	}
+	if !s.operatorOnly(w, r, false) {
+		return
+	}
 	if s.cfg.NetworkMode != config.ModePrivate {
 		writeError(w, http.StatusBadRequest, "invites are only available in private network mode")
 		return
@@ -303,6 +319,9 @@ func (s *Server) handleInviteGenerate(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleInviteAccept(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	if !s.operatorOnly(w, r, true) {
 		return
 	}
 	var req struct {

@@ -235,7 +235,12 @@ func Save(cfg *Config, path string) error {
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
-	return os.WriteFile(path, out, 0o600)
+	// Write-then-rename so a crash mid-write cannot leave a truncated config behind.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func (c *Config) Validate() error {
@@ -251,6 +256,9 @@ func (c *Config) Validate() error {
 	case ModeCustomPublic:
 		if c.NetworkID == "" {
 			return fmt.Errorf("network_mode=custom_public requires network_id")
+		}
+		if len(c.BootstrapPeers) == 0 {
+			return fmt.Errorf("network_mode=custom_public requires at least one bootstrap_peers entry")
 		}
 	default:
 		return fmt.Errorf("invalid network_mode %q (want public, private, or custom_public)", c.NetworkMode)

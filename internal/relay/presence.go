@@ -99,11 +99,21 @@ func (p *Presence) readLoop() {
 		if err != nil {
 			continue
 		}
-		via, err := peer.Decode(m.ViaNode)
-		if err != nil {
+		// The route goes to the node that signed the gossip message, whatever the
+		// body claims: a via_node field chosen by the sender let any mesh node
+		// point every app's traffic at an arbitrary peer.
+		via := msg.GetFrom()
+		if via == "" {
+			continue
+		}
+		if m.ViaNode != "" && m.ViaNode != via.String() {
 			continue
 		}
 		if m.Tombstone {
+			// Only the node currently serving the app may take it offline.
+			if cur, ok := p.router.Lookup(appPeer); !ok || cur != via {
+				continue
+			}
 			p.router.Remove(appPeer)
 			p.fire(appPeer, via, false)
 			continue
@@ -111,6 +121,9 @@ func (p *Presence) readLoop() {
 		ttl := time.Duration(m.TTLSeconds) * time.Second
 		if ttl <= 0 {
 			ttl = p.ttl
+		}
+		if ttl > MaxPresenceTTL {
+			ttl = MaxPresenceTTL
 		}
 		p.router.Upsert(appPeer, via, ttl)
 		p.fire(appPeer, via, true)

@@ -57,7 +57,7 @@ func NewServer(cfg *config.Config, configPath string, h host.Host, scope string)
 		scope:      scope,
 		startedAt:  time.Now(),
 		upgrader: websocket.Upgrader{
-			CheckOrigin: func(*http.Request) bool { return true },
+			CheckOrigin: originAllowed,
 		},
 		clients: make(map[*wsClient]struct{}),
 		rv:      newRendezvousStore(rendezvousPathFor(configPath)),
@@ -170,8 +170,10 @@ func (s *Server) Start() error {
 		host = "127.0.0.1"
 	}
 	s.httpSrv = &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", host, s.cfg.APIPort),
-		Handler: s.routes(),
+		Addr:              fmt.Sprintf("%s:%d", host, s.cfg.APIPort),
+		Handler:           s.routes(),
+		ReadHeaderTimeout: 15 * time.Second,
+		IdleTimeout:       2 * time.Minute,
 	}
 	log.Printf("API server listening on http://%s:%d", host, s.cfg.APIPort)
 	if err := s.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

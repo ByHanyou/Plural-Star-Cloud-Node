@@ -94,3 +94,31 @@ func TestRouterUpsertLookupExpire(t *testing.T) {
 }
 
 var _ peer.ID
+
+func TestQueueCaps(t *testing.T) {
+	q := &Queue{items: make(map[peer.ID]map[string]queuedPacket)}
+	big := &Packet{SenderID: []byte("s"), RecipientID: []byte("r"), Payload: make([]byte, QueueMaxBytes/2)}
+	if !q.Put(peer.ID("a"), big) {
+		t.Fatal("first packet should fit")
+	}
+	if !q.Put(peer.ID("a"), big) {
+		t.Fatal("replacing the same sender's packet should fit")
+	}
+	if q.Put(peer.ID("b"), big) {
+		t.Fatal("second recipient should exceed QueueMaxBytes")
+	}
+	small := &Packet{SenderID: []byte("s"), RecipientID: []byte("r"), Payload: []byte("x")}
+	if !q.Put(peer.ID("b"), small) {
+		t.Fatal("small packet should fit")
+	}
+	if got := q.Take(peer.ID("a")); len(got) != 1 {
+		t.Fatalf("take returned %d packets, want 1", len(got))
+	}
+	if q.Bytes() != packetSize(small) {
+		t.Fatalf("bytes after take = %d, want %d", q.Bytes(), packetSize(small))
+	}
+	q.sweep()
+	if q.Bytes() != packetSize(small) {
+		t.Fatalf("sweep changed bytes to %d", q.Bytes())
+	}
+}

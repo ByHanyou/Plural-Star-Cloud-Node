@@ -28,6 +28,10 @@ type DeliverFunc func(*Packet)
 // always has.
 type OfflineFunc func(recipient peer.ID, p *Packet) bool
 
+// OfflineReplayFunc hands every packet parked for recipient to deliver, oldest
+// first, dropping each one deliver accepts, and reports how many it delivered.
+type OfflineReplayFunc func(recipient peer.ID, deliver func(*Packet) bool) int
+
 type Manager struct {
 	ctx      context.Context
 	h        host.Host
@@ -40,6 +44,7 @@ type Manager struct {
 
 	offlineMu sync.RWMutex
 	offline   OfflineFunc
+	replay    OfflineReplayFunc
 
 	mu         sync.RWMutex
 	localApps  map[peer.ID]DeliverFunc
@@ -87,6 +92,15 @@ func (m *Manager) SetOffline(f OfflineFunc) {
 	m.offlineMu.Unlock()
 }
 
+// SetOfflineReplay installs the drain for the persistent store, used when a
+// recipient comes online through another node. Without it packets parked on
+// disk waited for the app to connect to this node in particular.
+func (m *Manager) SetOfflineReplay(f OfflineReplayFunc) {
+	m.offlineMu.Lock()
+	m.replay = f
+	m.offlineMu.Unlock()
+}
+
 // hold parks a packet that could not be delivered or forwarded. The persistent
 // store gets first refusal; the in-memory queue takes whatever it declines.
 func (m *Manager) hold(recipient peer.ID, p *Packet) {
@@ -103,9 +117,6 @@ func (m *Manager) hold(recipient peer.ID, p *Packet) {
 // still cannot be delivered are put back, so nothing is lost by a failed flush.
 func (m *Manager) FlushQueued(recipient peer.ID) {
 	pending := m.queue.Take(recipient)
-	if len(pending) == 0 {
-		return
-	}
 	m.mu.RLock()
 	deliver, isLocal := m.localApps[recipient]
 	m.mu.RUnlock()
@@ -126,6 +137,12 @@ func (m *Manager) FlushQueued(recipient peer.ID) {
 		if err := m.forwardTo(via, p); err != nil {
 			m.hold(recipient, p)
 		}
+	}
+	m.offlineMu.RLock()
+	replay := m.replay
+	m.offlineMu.RUnlock()
+	if replay != nil {
+		replay(recipient, func(p *Packet) bool { return m.forwardTo(via, p) == nil })
 	}
 }
 
@@ -230,7 +247,7 @@ func (m *Manager) forwardTo(via peer.ID, p *Packet) error {
 
 func (m *Manager) handleStream(s corenet.Stream) {
 	defer s.Close()
-	r := msgio.NewReader(s)
+	r := msgio.NewReaderSize(s, MaxPacketBytes)
 	b, err := r.ReadMsg()
 	if err != nil {
 		_ = s.Reset()

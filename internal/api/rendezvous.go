@@ -35,7 +35,14 @@ type rendezvousStore struct {
 	entries map[string]rendezvousEntry
 	path    string
 	fileMu  sync.Mutex
+
+	// persistTimer coalesces writes: every put used to serialise the whole
+	// store (up to 20,000 × 8 KB) and rewrite the file synchronously, so a
+	// burst of registrations was a burst of multi-megabyte writes.
+	persistTimer *time.Timer
 }
+
+const rendezvousPersistDelay = 500 * time.Millisecond
 
 func rendezvousPathFor(configPath string) string {
 	if configPath == "" {
@@ -102,6 +109,24 @@ func (rs *rendezvousStore) persist(b []byte) {
 	_ = os.Rename(tmp, rs.path)
 }
 
+// schedulePersistLocked arranges one write of the current store shortly after
+// the last change. The caller holds rs.mu.
+func (rs *rendezvousStore) schedulePersistLocked() {
+	if rs.path == "" {
+		return
+	}
+	if rs.persistTimer != nil {
+		rs.persistTimer.Reset(rendezvousPersistDelay)
+		return
+	}
+	rs.persistTimer = time.AfterFunc(rendezvousPersistDelay, func() {
+		rs.mu.Lock()
+		snapshot := rs.snapshotLocked()
+		rs.mu.Unlock()
+		rs.persist(snapshot)
+	})
+}
+
 func (rs *rendezvousStore) janitor() {
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
@@ -115,12 +140,10 @@ func (rs *rendezvousStore) janitor() {
 				removed++
 			}
 		}
-		var snapshot []byte
 		if removed > 0 {
-			snapshot = rs.snapshotLocked()
+			rs.schedulePersistLocked()
 		}
 		rs.mu.Unlock()
-		rs.persist(snapshot)
 	}
 }
 
@@ -131,9 +154,8 @@ func (rs *rendezvousStore) put(namespace, record string, ttl time.Duration) bool
 		return false
 	}
 	rs.entries[namespace] = rendezvousEntry{record: record, expiresAt: time.Now().Add(ttl), local: true}
-	snapshot := rs.snapshotLocked()
+	rs.schedulePersistLocked()
 	rs.mu.Unlock()
-	rs.persist(snapshot)
 	return true
 }
 
@@ -141,7 +163,10 @@ func (rs *rendezvousStore) putRemote(namespace, record string, ttl time.Duration
 	expiresAt := time.Now().Add(ttl)
 	rs.mu.Lock()
 	cur, exists := rs.entries[namespace]
-	if exists && !cur.expiresAt.Before(expiresAt) {
+	// A record registered on this node by its own app is authoritative here:
+	// gossip from another node must not be able to replace it, or any node
+	// could break pairing for every namespace it has seen.
+	if exists && (cur.local || !cur.expiresAt.Before(expiresAt)) {
 		rs.mu.Unlock()
 		return
 	}
@@ -149,11 +174,9 @@ func (rs *rendezvousStore) putRemote(namespace, record string, ttl time.Duration
 		rs.mu.Unlock()
 		return
 	}
-	local := exists && cur.local
-	rs.entries[namespace] = rendezvousEntry{record: record, expiresAt: expiresAt, local: local}
-	snapshot := rs.snapshotLocked()
+	rs.entries[namespace] = rendezvousEntry{record: record, expiresAt: expiresAt, local: false}
+	rs.schedulePersistLocked()
 	rs.mu.Unlock()
-	rs.persist(snapshot)
 }
 
 func (rs *rendezvousStore) localEntries() []struct {

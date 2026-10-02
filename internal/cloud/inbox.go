@@ -30,6 +30,10 @@ type Inbox struct {
 	mu    sync.Mutex
 	locks map[peer.ID]*sync.Mutex
 
+	// full reports whether the disk is at the watermark; Store refuses new
+	// packets while it is, like every other write path.
+	full func() bool
+
 	// Live packet count for /health. It used to be computed by walking every
 	// recipient directory and stat-ing every file on EVERY request, and since
 	// the apps call /health on every wake that walk grew with the inbox until a
@@ -127,6 +131,9 @@ func (ib *Inbox) Store(recipient peer.ID, p *relay.Packet) bool {
 		return false
 	}
 	if int64(len(raw)) > ib.quota() {
+		return false
+	}
+	if ib.full != nil && ib.full() {
 		return false
 	}
 	unlock := ib.lock(recipient)

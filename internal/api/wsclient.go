@@ -15,6 +15,9 @@ const (
 	wsPongWait   = 60 * time.Second
 	wsPingPeriod = 50 * time.Second
 	wsSendBuffer = 64
+	// wsMaxMessage bounds a frame from the app; the socket only carries pongs and
+	// small control messages inbound.
+	wsMaxMessage = 64 << 10
 )
 
 type wsClient struct {
@@ -83,6 +86,7 @@ func (c *wsClient) writePump() {
 
 func (c *wsClient) readPump(onClose func()) {
 	defer onClose()
+	c.conn.SetReadLimit(wsMaxMessage)
 	_ = c.conn.SetReadDeadline(time.Now().Add(wsPongWait))
 	c.conn.SetPongHandler(func(string) error {
 		return c.conn.SetReadDeadline(time.Now().Add(wsPongWait))

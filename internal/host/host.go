@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/config"
@@ -151,20 +152,19 @@ func NewDHT(ctx context.Context, h host.Host, prefix string) (*dht.IpfsDHT, erro
 	return kdht, nil
 }
 
-func ConnectBootstrap(ctx context.Context, h host.Host, addrs []string) (int, error) {
-	infos, err := ParsePeerAddrs(addrs)
-	if err != nil {
-		return 0, err
-	}
-	return ConnectPeers(ctx, h, infos)
-}
-
 // ConnectPeers dials every target we are not already connected to and reports
 // how many NEW connections were made. Skipping live connections keeps the
 // reconnect loop's count honest and its log quiet while the mesh is healthy.
 func ConnectPeers(ctx context.Context, h host.Host, infos []peer.AddrInfo) (int, error) {
-	connected := 0
-	var firstErr error
+	// Dials run a few at a time: sequential 30 s timeouts over the bootstrap list
+	// plus up to 64 remembered peers could block a reconnect tick for half an hour.
+	var (
+		mu        sync.Mutex
+		wg        sync.WaitGroup
+		connected int
+		firstErr  error
+	)
+	sem := make(chan struct{}, 8)
 	for _, ai := range infos {
 		if ai.ID == h.ID() {
 			continue
@@ -172,16 +172,26 @@ func ConnectPeers(ctx context.Context, h host.Host, infos []peer.AddrInfo) (int,
 		if h.Network().Connectedness(ai.ID) == libp2pnetwork.Connected {
 			continue
 		}
-		dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		if cErr := h.Connect(dialCtx, ai); cErr != nil {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("connect %s: %w", ai.ID, cErr)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(ai peer.AddrInfo) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			cErr := h.Connect(dialCtx, ai)
+			mu.Lock()
+			defer mu.Unlock()
+			if cErr != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("connect %s: %w", ai.ID, cErr)
+				}
+				return
 			}
-		} else {
 			connected++
-		}
-		cancel()
+		}(ai)
 	}
+	wg.Wait()
 	return connected, firstErr
 }
 

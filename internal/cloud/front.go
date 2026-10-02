@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 )
 
 // FrontEntry mirrors the gateway's cache record so a reader can rebuild the
@@ -55,6 +57,32 @@ func (f *frontStore) Get(peerID string) (FrontEntry, bool) {
 		return FrontEntry{}, false
 	}
 	return e, true
+}
+
+// sweep removes entries nobody has refreshed for maxAge; the cache holds the
+// author's fronters in plaintext and should not outlive the account it served.
+func (f *frontStore) sweep(maxAge time.Duration) int {
+	entries, err := os.ReadDir(f.dir)
+	if err != nil {
+		return 0
+	}
+	cutoff := time.Now().Add(-maxAge)
+	removed := 0
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		if os.Remove(filepath.Join(f.dir, e.Name())) == nil {
+			removed++
+		}
+	}
+	return removed
 }
 
 func (f *frontStore) count() int {

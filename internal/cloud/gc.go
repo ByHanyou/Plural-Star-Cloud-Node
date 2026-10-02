@@ -9,7 +9,11 @@ import (
 	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/config"
 )
 
-const gcObjectGrace = 24 * time.Hour
+const (
+	gcObjectGrace = 24 * time.Hour
+	// frontMaxAge is how long an unrefreshed front cache entry is kept.
+	frontMaxAge = 30 * 24 * time.Hour
+)
 
 // runGC is the daily collection from section 7.5: objects no kept manifest
 // references, vaults whose zero-device grace has elapsed, expired inbox
@@ -17,14 +21,32 @@ const gcObjectGrace = 24 * time.Hour
 func (s *Service) runGC() {
 	start := time.Now()
 	graceCutoff := start.Add(-time.Duration(s.cfg.GraceDays) * 24 * time.Hour)
-	live, expired := s.vaults.liveObjects(graceCutoff)
+	// Upload fragments, inbox packets and idle locks are safe to sweep whatever
+	// happens to the object pass below.
+	defer func() {
+		s.objects.sweepParts(gcObjectGrace)
+		s.inbox.sweep()
+		s.fronts.sweep(frontMaxAge)
+		s.pruneLocks()
+	}()
+	live, expired, err := s.vaults.liveObjects(graceCutoff)
+	if err != nil {
+		// An unreadable vault.json or refs file must not make that vault's
+		// objects look unreferenced: they would be deleted from the local store
+		// and from S3. Collect nothing until every vault reads cleanly.
+		log.Printf("gc: object collection skipped: %v", err)
+		return
+	}
 	for _, id := range expired {
 		if err := s.vaults.Delete(id); err != nil {
 			log.Printf("gc: delete vault %s: %v", id, err)
 		}
 	}
 	if len(expired) > 0 {
-		live, _ = s.vaults.liveObjects(graceCutoff)
+		if live, _, err = s.vaults.liveObjects(graceCutoff); err != nil {
+			log.Printf("gc: object collection skipped: %v", err)
+			return
+		}
 	}
 	removed, freed := s.collectObjects(s.objects.local, live, start)
 	if s.media.Name() != config.MediaBackendLocal {
@@ -32,9 +54,6 @@ func (s *Service) runGC() {
 		removed += r
 		freed += f
 	}
-	s.objects.sweepParts(gcObjectGrace)
-	s.inbox.sweep()
-	s.pruneLocks()
 	log.Printf("gc: %d vault(s) expired, %d object(s) removed (%d bytes), %d live, %s",
 		len(expired), removed, freed, len(live), time.Since(start).Round(time.Millisecond))
 }

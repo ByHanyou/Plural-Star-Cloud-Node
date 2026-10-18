@@ -145,7 +145,6 @@ func (o *objectStore) findPart(vault, id string) (path string, tier string, tota
 	return "", "", 0, 0, false
 }
 
-// Received reports how many bytes of a pending upload have arrived, for resume.
 func (o *objectStore) Received(vault, id string) (int64, bool) {
 	unlock := o.lock(vault + "." + id)
 	defer unlock()
@@ -160,9 +159,6 @@ type uploadResult struct {
 	Tier     string
 }
 
-// Append writes one chunk of an upload. start must equal the bytes already
-// received; total is the object's full size. When the last byte lands the
-// ciphertext is hashed, checked against id, and moved into its backend.
 func (o *objectStore) Append(vault, id, tier string, start, total int64, body io.Reader) (uploadResult, error) {
 	if tier != TierBase && tier != TierMedia {
 		return uploadResult{}, fmt.Errorf("invalid tier %q", tier)
@@ -237,7 +233,6 @@ func (o *objectStore) finalize(path, id, tier string) error {
 	return backend.PutFile(id, path)
 }
 
-// Abandon deletes a pending upload for vault and id, if any.
 func (o *objectStore) Abandon(vault, id string) {
 	unlock := o.lock(vault + "." + id)
 	defer unlock()
@@ -246,7 +241,6 @@ func (o *objectStore) Abandon(vault, id string) {
 	}
 }
 
-// sweepParts removes upload fragments nobody has touched for a day.
 func (o *objectStore) sweepParts(olderThan time.Duration) {
 	entries, err := os.ReadDir(o.tmp)
 	if err != nil {
@@ -264,7 +258,6 @@ func (o *objectStore) sweepParts(olderThan time.Duration) {
 	}
 }
 
-// Hash computes the object ID of a ciphertext, for tests and tooling.
 func Hash(b []byte) string {
 	sum := blake2b.Sum256(b)
 	return hex.EncodeToString(sum[:])

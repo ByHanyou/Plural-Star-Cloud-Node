@@ -79,9 +79,6 @@ func run(configPath string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Cloud services come up before the host because the host advertises its
-	// roles and push box key in the libp2p agent string at construction time,
-	// and the push box key does not exist until the service has loaded it.
 	n := &node{cfg: cfg}
 	pushPub := ""
 	if cfg.Cloud.Enabled {
@@ -161,9 +158,6 @@ func run(configPath string) error {
 	go srv.RendezvousReannounceLoop(ctx)
 	log.Printf("rendezvous gossip joined %q", network.GossipPrefix(cfg)+"rendezvous")
 
-	// Cloud services ride the same binary and the same API port. They attach
-	// before srv.Start builds the mux, and the inbox takes over from the relay's
-	// in-memory queue as the holding place for packets to offline peers.
 	if n.cloud != nil {
 		srv.SetCloud(n.cloud)
 		mgr.SetOffline(n.cloud.Inbox().Store)
@@ -209,14 +203,6 @@ func run(configPath string) error {
 		_ = srv.Shutdown(shutCtx)
 	}()
 
-	// Remembered peers ride alongside the bootstrap list everywhere it is
-	// dialled. The static list has a single entry, so on its own it makes the
-	// bootstrap node a double point of failure: a node restarting while the
-	// bootstrap is down comes up stranded even though the mesh is alive, and
-	// the bootstrap node itself dials nobody after a reboot because the only
-	// entry is its own address. Remembering who we were connected to lets
-	// every node redial the mesh it last saw, so the network heals from
-	// whichever side comes back first, with no restarts anywhere.
 	peerMem := psnhost.LoadPeerMemory(filepath.Join(filepath.Dir(configPath), "known_peers.json"))
 
 	bootstrapPeers := network.BootstrapPeers(cfg)
@@ -232,8 +218,6 @@ func run(configPath string) error {
 		if bErr != nil {
 			log.Printf("initial bootstrap partial: %v", bErr)
 		}
-		// Remember whoever that reached straight away, so even a node that
-		// dies before the first reconnect tick keeps what it learned.
 		peerMem.Snapshot(h)
 		peerMem.Save()
 	} else if cfg.NetworkMode == config.ModePublic {
@@ -247,8 +231,6 @@ func run(configPath string) error {
 	log.Printf("node running; press Ctrl-C to stop")
 	<-ctx.Done()
 	log.Printf("shutting down")
-	// Final snapshot: a clean shutdown (reboot, update) is exactly the moment
-	// the current mesh view is most worth keeping for the next boot.
 	peerMem.Snapshot(h)
 	peerMem.Save()
 	return nil
@@ -262,8 +244,6 @@ func persistentReconnectLoop(ctx context.Context, h host.Host, bootstrapInfos []
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Record the mesh as it is before dialling, so an address that is
-			// about to die of a reboot was already saved while it worked.
 			peerMem.Snapshot(h)
 			peerMem.Save()
 			targets := psnhost.MergeTargets(bootstrapInfos, peerMem.DialTargets(h.ID()))
@@ -296,13 +276,9 @@ func monitorConnections(ctx context.Context, h host.Host) {
 
 func printFirstRun(configPath, token string) {
 	fmt.Println("=====================================================")
-	fmt.Println(" Plural Star Node — first run")
+	fmt.Println(" Plural Star Node - first run")
 	fmt.Printf(" Wrote default config to: %s\n", configPath)
 	if token == "" {
-		// A first run is always a public node, and a public node must stay
-		// open. Telling the operator to set a token here is what started the
-		// lockout: it reads as hardening, and instead it shuts out every app
-		// on the default network. Auth belongs to private/custom_public.
 		fmt.Println(" API auth is open, which is correct for a public node: apps on the")
 		fmt.Println(" default network have no token. api_token is for private and")
 		fmt.Println(" custom_public networks only, and is ignored here.")

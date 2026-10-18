@@ -36,7 +36,6 @@ type rendezvousStore struct {
 	path    string
 	fileMu  sync.Mutex
 
-	// persistTimer coalesces store writes.
 	persistTimer *time.Timer
 }
 
@@ -107,8 +106,6 @@ func (rs *rendezvousStore) persist(b []byte) {
 	_ = os.Rename(tmp, rs.path)
 }
 
-// schedulePersistLocked arranges one write of the current store shortly after
-// the last change. The caller holds rs.mu.
 func (rs *rendezvousStore) schedulePersistLocked() {
 	if rs.path == "" {
 		return
@@ -161,7 +158,6 @@ func (rs *rendezvousStore) putRemote(namespace, record string, ttl time.Duration
 	expiresAt := time.Now().Add(ttl)
 	rs.mu.Lock()
 	cur, exists := rs.entries[namespace]
-	// A record registered here by its own app is authoritative; gossip may not replace it.
 	if exists && (cur.local || !cur.expiresAt.Before(expiresAt)) {
 		rs.mu.Unlock()
 		return

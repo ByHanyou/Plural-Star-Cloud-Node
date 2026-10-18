@@ -70,8 +70,6 @@ func TestPeerMemorySkipsSelfAndExpired(t *testing.T) {
 		t.Fatalf("self should be excluded, got %v", targets)
 	}
 
-	// An entry older than the TTL never comes back from disk. Written by hand
-	// so it is Load's cutoff being tested, not Save's trim.
 	stale := time.Now().Add(-peerMemoryTTL - time.Hour).Unix()
 	path2 := filepath.Join(t.TempDir(), "known_peers.json")
 	raw := []byte(`[{"id":"` + testPeerA + `","addrs":["/ip4/10.0.0.5/tcp/4001"],"last_seen":` + strconv.FormatInt(stale, 10) + `}]`)

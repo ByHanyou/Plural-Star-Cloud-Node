@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,10 +27,25 @@ var (
 	ErrMissingObject = errors.New("manifest references missing objects")
 )
 
+var (
+	ErrDeviceKeyRequired = errors.New("device key required")
+	ErrDeviceUnlinked    = errors.New("device unlinked")
+	ErrDeviceKeyIssued   = errors.New("device key already issued")
+)
+
 type ObjRef struct {
 	ID   string `json:"id"`
 	Tier string `json:"tier"`
 	Size int64  `json:"size"`
+}
+
+type pendingRef struct {
+	ObjRef
+	At int64 `json:"at,omitempty"`
+}
+
+func (p pendingRef) expired(now time.Time) bool {
+	return p.At <= 0 || now.Sub(time.UnixMilli(p.At)) > gcObjectGrace
 }
 
 type Device struct {
@@ -38,15 +54,28 @@ type Device struct {
 	LastSeen int64  `json:"last_seen"`
 }
 
+type deviceEntry struct {
+	Device
+	KeyHash string `json:"key_hash,omitempty"`
+}
+
+func publicDevices(entries []deviceEntry) []Device {
+	out := make([]Device, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.Device)
+	}
+	return out
+}
+
 type vaultMeta struct {
-	Created          int64             `json:"created"`
-	Updated          int64             `json:"updated"`
-	AuthHash         string            `json:"auth_hash"`
-	WrappedMasterKey string            `json:"wrapped_master_key"`
-	Version          int64             `json:"version"`
-	Devices          []Device          `json:"devices"`
-	GraceStartedAt   int64             `json:"grace_started_at"`
-	Pending          map[string]ObjRef `json:"pending"`
+	Created          int64                 `json:"created"`
+	Updated          int64                 `json:"updated"`
+	AuthHash         string                `json:"auth_hash"`
+	WrappedMasterKey string                `json:"wrapped_master_key"`
+	Version          int64                 `json:"version"`
+	Devices          []deviceEntry         `json:"devices"`
+	GraceStartedAt   int64                 `json:"grace_started_at"`
+	Pending          map[string]pendingRef `json:"pending"`
 }
 
 type VaultInfo struct {
@@ -151,7 +180,7 @@ func (v *vaultStore) readMeta(id string) (*vaultMeta, error) {
 		return nil, fmt.Errorf("vault %s: corrupt vault.json: %w", id, err)
 	}
 	if m.Pending == nil {
-		m.Pending = make(map[string]ObjRef)
+		m.Pending = make(map[string]pendingRef)
 	}
 	return &m, nil
 }
@@ -173,7 +202,6 @@ func (v *vaultStore) writeMeta(id string, m *vaultMeta) error {
 	return writeAtomic(filepath.Join(v.path(id), "vault.json"), raw)
 }
 
-// authed loads the vault and checks the auth secret. The caller holds the lock.
 func (v *vaultStore) authed(id, secret string) (*vaultMeta, error) {
 	m, err := v.readMeta(id)
 	if err != nil {
@@ -199,8 +227,8 @@ func (v *vaultStore) Create(id, secret, wrappedMasterKey string) error {
 		Created:          now,
 		AuthHash:         hashSecret(secret),
 		WrappedMasterKey: wrappedMasterKey,
-		Devices:          []Device{},
-		Pending:          make(map[string]ObjRef),
+		Devices:          []deviceEntry{},
+		Pending:          make(map[string]pendingRef),
 	}
 	return v.writeMeta(id, m)
 }
@@ -232,16 +260,19 @@ func (v *vaultStore) usage(id string, m *vaultMeta) (map[string]int64, map[strin
 	for _, r := range refs {
 		known[r.ID] = r
 	}
-	for _, r := range m.Pending {
-		if _, seen := known[r.ID]; !seen {
-			known[r.ID] = r
+	now := time.Now()
+	for _, p := range m.Pending {
+		if p.expired(now) {
+			continue
+		}
+		if _, seen := known[p.ID]; !seen {
+			known[p.ID] = p.ObjRef
 		}
 	}
 	use := map[string]int64{TierBase: 0, TierMedia: 0}
 	for _, r := range known {
 		use[r.Tier] += r.Size
 	}
-	// The current manifest counts against the quota too.
 	if m.Version > 0 {
 		if st, serr := os.Stat(filepath.Join(v.path(id), "manifest."+strconv.FormatInt(m.Version, 10))); serr == nil {
 			use[TierBase] += st.Size()
@@ -265,7 +296,7 @@ func (v *vaultStore) Info(id, secret string) (*VaultInfo, error) {
 		Created:          m.Created,
 		Updated:          m.Updated,
 		Version:          m.Version,
-		Devices:          m.Devices,
+		Devices:          publicDevices(m.Devices),
 		GraceStartedAt:   m.GraceStartedAt,
 		WrappedMasterKey: m.WrappedMasterKey,
 		Usage:            use,
@@ -273,7 +304,6 @@ func (v *vaultStore) Info(id, secret string) (*VaultInfo, error) {
 	}, nil
 }
 
-// ReserveObject checks the tier quota for an upload of size bytes.
 func (v *vaultStore) ReserveObject(id, secret, objID, tier string, size int64) error {
 	unlock := v.lock(id)
 	defer unlock()
@@ -294,7 +324,6 @@ func (v *vaultStore) ReserveObject(id, secret, objID, tier string, size int64) e
 	return nil
 }
 
-// CommitObject records a finished upload as pending until a manifest names it.
 func (v *vaultStore) CommitObject(id, secret string, ref ObjRef) error {
 	unlock := v.lock(id)
 	defer unlock()
@@ -302,11 +331,10 @@ func (v *vaultStore) CommitObject(id, secret string, ref ObjRef) error {
 	if err != nil {
 		return err
 	}
-	m.Pending[ref.ID] = ref
+	m.Pending[ref.ID] = pendingRef{ObjRef: ref, At: time.Now().UnixMilli()}
 	return v.writeMeta(id, m)
 }
 
-// Owns reports whether objID belongs to the vault (referenced or pending).
 func (v *vaultStore) Owns(id, secret, objID string) (bool, error) {
 	unlock := v.lock(id)
 	defer unlock()
@@ -422,7 +450,7 @@ func (v *vaultStore) PutManifest(id, secret string, expected int64, ciphertext [
 		return m.Version, err
 	}
 	m.Version = next
-	m.Pending = make(map[string]ObjRef)
+	m.Pending = make(map[string]pendingRef)
 	if err := v.writeMeta(id, m); err != nil {
 		return m.Version, err
 	}
@@ -476,30 +504,90 @@ func (v *vaultStore) keptVersions(id string) []int64 {
 	return out
 }
 
-func (v *vaultStore) LinkDevice(id, secret, subID, label string) ([]Device, error) {
+func (v *vaultStore) LinkDevice(id, secret, subID, label string) ([]Device, string, bool, error) {
 	unlock := v.lock(id)
 	defer unlock()
 	m, err := v.authed(id, secret)
 	if err != nil {
-		return nil, err
+		return nil, "", false, err
 	}
+	key, err := newDeviceKey()
+	if err != nil {
+		return nil, "", false, err
+	}
+	keyHash := hashSecret(key)
 	now := time.Now().UnixMilli()
 	found := false
 	for i := range m.Devices {
 		if m.Devices[i].SubID == subID {
 			m.Devices[i].Label = label
 			m.Devices[i].LastSeen = now
+			m.Devices[i].KeyHash = keyHash
 			found = true
 		}
 	}
 	if !found {
-		m.Devices = append(m.Devices, Device{SubID: subID, Label: label, LastSeen: now})
+		m.Devices = append(m.Devices, deviceEntry{Device: Device{SubID: subID, Label: label, LastSeen: now}, KeyHash: keyHash})
 	}
 	m.GraceStartedAt = 0
 	if err := v.writeMeta(id, m); err != nil {
-		return nil, err
+		return nil, "", false, err
 	}
-	return m.Devices, nil
+	return publicDevices(m.Devices), key, found, nil
+}
+
+func (v *vaultStore) IssueDeviceKey(id, secret, subID string) (string, error) {
+	unlock := v.lock(id)
+	defer unlock()
+	m, err := v.authed(id, secret)
+	if err != nil {
+		return "", err
+	}
+	found := false
+	for _, d := range m.Devices {
+		if d.SubID != subID {
+			continue
+		}
+		if d.KeyHash != "" {
+			return "", ErrDeviceKeyIssued
+		}
+		found = true
+	}
+	if !found {
+		return "", ErrDeviceUnlinked
+	}
+	key, err := newDeviceKey()
+	if err != nil {
+		return "", err
+	}
+	keyHash := hashSecret(key)
+	for i := range m.Devices {
+		if m.Devices[i].SubID == subID {
+			m.Devices[i].KeyHash = keyHash
+		}
+	}
+	if err := v.writeMeta(id, m); err != nil {
+		return "", err
+	}
+	return key, nil
+}
+
+func (v *vaultStore) CheckDevice(id, secret, subID, key string) error {
+	unlock := v.lock(id)
+	defer unlock()
+	m, err := v.authed(id, secret)
+	if err != nil {
+		return err
+	}
+	if subID == "" || key == "" {
+		return ErrDeviceKeyRequired
+	}
+	for _, d := range m.Devices {
+		if d.SubID == subID && d.KeyHash != "" && validHex32(key) && secretMatches(d.KeyHash, key) {
+			return nil
+		}
+	}
+	return ErrDeviceUnlinked
 }
 
 func (v *vaultStore) UnlinkDevice(id, secret, subID string) ([]Device, error) {
@@ -522,7 +610,7 @@ func (v *vaultStore) UnlinkDevice(id, secret, subID string) ([]Device, error) {
 	if err := v.writeMeta(id, m); err != nil {
 		return nil, err
 	}
-	return m.Devices, nil
+	return publicDevices(m.Devices), nil
 }
 
 func (v *vaultStore) Rewrap(id, secret, newID, newSecret, wrappedMasterKey string) error {
@@ -558,26 +646,19 @@ func (v *vaultStore) Delete(id string) error {
 	return os.RemoveAll(v.path(id))
 }
 
-// liveObjects returns every object ID referenced by any kept manifest version
-// or pending in any vault, plus the vaults whose grace period has elapsed.
-//
-// Unreadable metadata is an error, never an empty vault: the caller deletes
-// every object not in live.
 func (v *vaultStore) liveObjects(graceCutoff time.Time) (live map[string]struct{}, expiredVaults []string, err error) {
 	live = make(map[string]struct{})
+	now := time.Now()
 	for _, id := range v.ids() {
 		unlock := v.lock(id)
 		m, rerr := v.readMeta(id)
 		if rerr != nil {
 			unlock()
 			if errors.Is(rerr, ErrVaultMissing) {
-				// A directory without vault.json is a create that died halfway.
 				continue
 			}
 			return nil, nil, rerr
 		}
-		// A vault with no linked device expires GraceDays after the unlink that
-		// emptied it, or, when nothing was ever linked, after its last write.
 		graceStart := m.GraceStartedAt
 		if graceStart == 0 {
 			graceStart = m.Updated
@@ -587,8 +668,19 @@ func (v *vaultStore) liveObjects(graceCutoff time.Time) (live map[string]struct{
 			unlock()
 			continue
 		}
-		for _, r := range m.Pending {
-			live[r.ID] = struct{}{}
+		pruned := false
+		for objID, p := range m.Pending {
+			if p.expired(now) {
+				delete(m.Pending, objID)
+				pruned = true
+				continue
+			}
+			live[p.ID] = struct{}{}
+		}
+		if pruned {
+			if werr := v.writeMeta(id, m); werr != nil {
+				log.Printf("gc: prune pending in vault %s: %v", id, werr)
+			}
 		}
 		for _, ver := range v.keptVersions(id) {
 			refs, rerr := v.refs(id, ver)

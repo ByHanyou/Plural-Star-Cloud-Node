@@ -21,11 +21,6 @@ const DefaultAPIPort = 7523
 type Config struct {
 	KeypairPath string `yaml:"keypair_path" json:"keypair_path"`
 
-	// RequireExistingIdentity makes a missing keypair file a fatal error
-	// instead of generating a new one. The peer ID derived from node.key is
-	// compiled into every shipped app as the bootstrap entry, so on the
-	// production node a silently regenerated key is an outage that looks
-	// like a normal start. Community nodes leave this false.
 	RequireExistingIdentity bool `yaml:"require_existing_identity" json:"require_existing_identity"`
 
 	NetworkMode string `yaml:"network_mode" json:"network_mode"`
@@ -42,13 +37,6 @@ type Config struct {
 	APIPort  int    `yaml:"api_port" json:"api_port"`
 	APIToken string `yaml:"api_token" json:"api_token"`
 
-	// DebugAddr turns on Go's pprof handlers on their OWN listener. Empty (the
-	// default) means off. It must be a loopback address and is refused
-	// otherwise: the main API binds 0.0.0.0 in production and pprof would hand
-	// the internet full heap and goroutine dumps. Reach it over an SSH tunnel.
-	// Exists because diagnosing the 2026-09 goroutine leak from signals alone
-	// was impossible: SIGQUIT needs GOTRACEBACK=all and journald silently
-	// rate-limits the dump away.
 	DebugAddr string `yaml:"debug_addr" json:"debug_addr"`
 
 	ListenAddrs   []string `yaml:"listen_addrs" json:"listen_addrs"`
@@ -209,13 +197,6 @@ func Load(path string) (cfg *Config, firstRun bool, err error) {
 		return nil, false, fmt.Errorf("parse config %q: %w", path, err)
 	}
 
-	// A node on the default public network exists to serve app users who have
-	// no token and never will, so every endpoint an app touches is behind the
-	// same auth gate. An api_token here therefore does not secure the node, it
-	// shuts the whole network out, and because nothing reads the file until the
-	// next start the damage stays invisible until a reboot. Strip it, say so,
-	// and write the file back so it cannot come back a third time. Private and
-	// custom_public networks are operator-run and still honour a token.
 	if cfg.NetworkMode == ModePublic && cfg.APIToken != "" {
 		cfg.APIToken = ""
 		log.Printf("config: api_token ignored and removed from %s. A public node must stay open or it locks out every app on the default network.", path)
@@ -235,7 +216,6 @@ func Save(cfg *Config, path string) error {
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
-	// Write-then-rename so a crash mid-write cannot leave a truncated config behind.
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
 		return err

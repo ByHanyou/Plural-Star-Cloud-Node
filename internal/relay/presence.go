@@ -99,7 +99,6 @@ func (p *Presence) readLoop() {
 		if err != nil {
 			continue
 		}
-		// The route goes to the node that signed the message, not to the via_node the body claims.
 		via := msg.GetFrom()
 		if via == "" {
 			continue
@@ -108,7 +107,6 @@ func (p *Presence) readLoop() {
 			continue
 		}
 		if m.Tombstone {
-			// Only the node currently serving the app may take it offline.
 			if cur, ok := p.router.Lookup(appPeer); !ok || cur != via {
 				continue
 			}

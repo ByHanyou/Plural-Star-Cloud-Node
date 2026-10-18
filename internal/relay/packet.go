@@ -11,15 +11,13 @@ import (
 const (
 	RelayProtocol = "/plural-star/relay/1.0.0"
 
-	PresenceTTL = 90 * time.Second
-	// MaxPresenceTTL caps the lifetime a remote node may request for a route.
+	PresenceTTL             = 90 * time.Second
 	MaxPresenceTTL          = 10 * time.Minute
 	PresenceRefreshInterval = 45 * time.Second
 	DedupCacheTTL           = 10 * time.Second
 	DedupCacheEvictInterval = 5 * time.Second
 	RoutingTablePruneTicker = 30 * time.Second
 
-	// MaxPacketBytes bounds one relay frame between nodes.
 	MaxPacketBytes = 2 << 20
 )
 

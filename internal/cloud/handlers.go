@@ -38,6 +38,7 @@ func (s *Service) Register(mux *http.ServeMux, authed Middleware) {
 	mux.HandleFunc("PUT /cloud/vault/objects/{id}", authed(s.handleObjectPut))
 	mux.HandleFunc("POST /cloud/vault/devices", authed(s.handleDeviceLink))
 	mux.HandleFunc("DELETE /cloud/vault/devices/{sub_id}", authed(s.handleDeviceUnlink))
+	mux.HandleFunc("POST /cloud/vault/devices/{sub_id}/key", authed(s.handleDeviceKey))
 	mux.HandleFunc("POST /cloud/vault/rewrap", authed(s.handleRewrap))
 	mux.HandleFunc("GET /cloud/inbox", authed(s.handleInboxGet))
 	mux.HandleFunc("PUT /cloud/front/{peer_id}", authed(s.handleFrontPut))
@@ -131,6 +132,12 @@ func (s *Service) vaultError(w http.ResponseWriter, r *http.Request, lookupID st
 	case errors.Is(err, ErrBadAuth):
 		s.limiter.record(clientIP(r), lookupID)
 		writeError(w, http.StatusUnauthorized, "bad auth secret")
+	case errors.Is(err, ErrDeviceKeyRequired):
+		writeError(w, http.StatusUnauthorized, "device key required")
+	case errors.Is(err, ErrDeviceUnlinked):
+		writeError(w, http.StatusUnauthorized, "device unlinked")
+	case errors.Is(err, ErrDeviceKeyIssued):
+		writeError(w, http.StatusConflict, "device key already issued")
 	case errors.Is(err, ErrVaultExists):
 		writeError(w, http.StatusConflict, "vault already exists")
 	case errors.As(err, &verr):
@@ -155,6 +162,15 @@ func (s *Service) vaultError(w http.ResponseWriter, r *http.Request, lookupID st
 	default:
 		writeError(w, http.StatusInternalServerError, err.Error())
 	}
+}
+
+func (s *Service) deviceRefused(w http.ResponseWriter, r *http.Request, c vaultCreds) bool {
+	subID, key := readDeviceHeaders(r)
+	if err := s.vaults.CheckDevice(c.LookupID, c.AuthSecret, subID, key); err != nil {
+		s.vaultError(w, r, c.LookupID, err)
+		return true
+	}
+	return false
 }
 
 func (s *Service) handleVaultLookup(w http.ResponseWriter, r *http.Request) {
@@ -203,7 +219,6 @@ func (s *Service) handleVaultCreate(w http.ResponseWriter, r *http.Request) {
 	if s.watermarked(w) {
 		return
 	}
-	// Creation counts against the per-address window like a lookup.
 	s.limiter.record(clientIP(r), c.LookupID)
 	if err := s.vaults.Create(c.LookupID, c.AuthSecret, body.WrappedMasterKey); err != nil {
 		s.vaultError(w, r, c.LookupID, err)
@@ -219,6 +234,9 @@ func (s *Service) handleVaultInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.limited(w, r, c.LookupID) {
+		return
+	}
+	if s.deviceRefused(w, r, c) {
 		return
 	}
 	info, err := s.vaults.Info(c.LookupID, c.AuthSecret)
@@ -246,6 +264,9 @@ func (s *Service) handleManifestGet(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		version = parsed
+	}
+	if s.deviceRefused(w, r, c) {
+		return
 	}
 	m, wrapped, err := s.vaults.GetManifest(c.LookupID, c.AuthSecret, version)
 	if err != nil {
@@ -284,6 +305,9 @@ func (s *Service) handleManifestPut(w http.ResponseWriter, r *http.Request) {
 	if s.watermarked(w) {
 		return
 	}
+	if s.deviceRefused(w, r, c) {
+		return
+	}
 	version, err := s.vaults.PutManifest(c.LookupID, c.AuthSecret, body.ExpectedVersion, body.Ciphertext, body.Objects)
 	if err != nil {
 		s.vaultError(w, r, c.LookupID, err)
@@ -309,6 +333,9 @@ func (s *Service) handleObjectHead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.limited(w, r, c.LookupID) {
+		return
+	}
+	if s.deviceRefused(w, r, c) {
 		return
 	}
 	owns, err := s.vaults.Owns(c.LookupID, c.AuthSecret, id)
@@ -341,6 +368,9 @@ func (s *Service) handleObjectGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.limited(w, r, c.LookupID) {
+		return
+	}
+	if s.deviceRefused(w, r, c) {
 		return
 	}
 	owns, err := s.vaults.Owns(c.LookupID, c.AuthSecret, id)
@@ -438,6 +468,9 @@ func (s *Service) handleObjectPut(w http.ResponseWriter, r *http.Request) {
 	if s.watermarked(w) {
 		return
 	}
+	if s.deviceRefused(w, r, c) {
+		return
+	}
 	if size, existingTier, herr := s.objects.Head(id); herr == nil {
 		if err := s.vaults.CommitObject(c.LookupID, c.AuthSecret, ObjRef{ID: id, Tier: existingTier, Size: size}); err != nil {
 			s.vaultError(w, r, c.LookupID, err)
@@ -503,12 +536,16 @@ func (s *Service) handleDeviceLink(w http.ResponseWriter, r *http.Request) {
 	if s.limited(w, r, c.LookupID) {
 		return
 	}
-	devices, err := s.vaults.LinkDevice(c.LookupID, c.AuthSecret, body.SubID, body.Label)
+	devices, key, existed, err := s.vaults.LinkDevice(c.LookupID, c.AuthSecret, body.SubID, body.Label)
 	if err != nil {
 		s.vaultError(w, r, c.LookupID, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"devices": devices})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"devices":    devices,
+		"device_key": key,
+		"existed":    existed,
+	})
 }
 
 func (s *Service) handleDeviceUnlink(w http.ResponseWriter, r *http.Request) {
@@ -525,6 +562,9 @@ func (s *Service) handleDeviceUnlink(w http.ResponseWriter, r *http.Request) {
 	if s.limited(w, r, c.LookupID) {
 		return
 	}
+	if s.deviceRefused(w, r, c) {
+		return
+	}
 	devices, err := s.vaults.UnlinkDevice(c.LookupID, c.AuthSecret, subID)
 	if err != nil {
 		s.vaultError(w, r, c.LookupID, err)
@@ -534,6 +574,32 @@ func (s *Service) handleDeviceUnlink(w http.ResponseWriter, r *http.Request) {
 		"devices":    devices,
 		"grace_days": s.cfg.GraceDays,
 	})
+}
+
+func (s *Service) handleDeviceKey(w http.ResponseWriter, r *http.Request) {
+	var body vaultCreds
+	if r.ContentLength != 0 && !decodeJSON(w, r, maxJSONBody, &body) {
+		return
+	}
+	c, ok := s.creds(r, &body)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "vault credentials required")
+		return
+	}
+	subID := strings.TrimSpace(r.PathValue("sub_id"))
+	if subID == "" {
+		writeError(w, http.StatusBadRequest, "sub_id is required")
+		return
+	}
+	if s.limited(w, r, c.LookupID) {
+		return
+	}
+	key, err := s.vaults.IssueDeviceKey(c.LookupID, c.AuthSecret, subID)
+	if err != nil {
+		s.vaultError(w, r, c.LookupID, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"device_key": key})
 }
 
 func (s *Service) handleRewrap(w http.ResponseWriter, r *http.Request) {
@@ -570,6 +636,9 @@ func (s *Service) handleRewrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.limited(w, r, c.LookupID) {
+		return
+	}
+	if s.deviceRefused(w, r, c) {
 		return
 	}
 	if err := s.vaults.Rewrap(c.LookupID, c.AuthSecret, newID, newSecret, body.WrappedMasterKey); err != nil {
@@ -729,8 +798,6 @@ type pushEnvelope struct {
 	SenderBoxPub string `json:"sender_box_pub"`
 }
 
-// pushBody returns the plaintext request the gateway will verify, opening a
-// sealed envelope with this node's box key when the sender used one.
 func (s *Service) pushBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, pushMaxBody)
 	raw, err := io.ReadAll(r.Body)

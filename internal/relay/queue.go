@@ -11,15 +11,10 @@ import (
 )
 
 const (
-	// QueueEntryTTL is how long an undeliverable packet is held before it is dropped.
-	QueueEntryTTL = 7 * 24 * time.Hour
-	// QueueMaxSenders caps how many distinct senders may hold a slot for one recipient.
-	QueueMaxSenders = 500
-	// QueueMaxRecipients caps how many recipients may have packets waiting at once.
+	QueueEntryTTL      = 7 * 24 * time.Hour
+	QueueMaxSenders    = 500
 	QueueMaxRecipients = 10000
-	// QueueMaxBytes caps the memory held by the whole queue.
-	QueueMaxBytes = 64 << 20
-	// QueueSweepInterval is how often expired entries are pruned.
+	QueueMaxBytes      = 64 << 20
 	QueueSweepInterval = 30 * time.Minute
 )
 
@@ -29,12 +24,6 @@ type queuedPacket struct {
 	size int64
 }
 
-// Queue holds the NEWEST undeliverable packet per (recipient, sender) pair.
-// A newer packet from the same sender replaces the older one — recipients get
-// current state on reconnect, never a replay of a backlog.
-//
-// Payloads are sealed end-to-end by the apps, so the node stores ciphertext it
-// cannot read.
 type Queue struct {
 	mu    sync.Mutex
 	items map[peer.ID]map[string]queuedPacket
@@ -51,8 +40,6 @@ func packetSize(p *Packet) int64 {
 	return int64(len(p.ID) + len(p.SenderID) + len(p.RecipientID) + len(p.Payload) + 8)
 }
 
-// Put stores p for recipient, replacing any earlier packet from the same
-// sender. It reports false when a cap left no room and the packet was dropped.
 func (q *Queue) Put(recipient peer.ID, p *Packet) bool {
 	if p == nil {
 		return false
@@ -87,7 +74,6 @@ func (q *Queue) Put(recipient peer.ID, p *Packet) bool {
 	return true
 }
 
-// Take removes and returns everything queued for recipient.
 func (q *Queue) Take(recipient peer.ID) []*Packet {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -108,14 +94,12 @@ func (q *Queue) Take(recipient peer.ID) []*Packet {
 	return out
 }
 
-// Len reports how many packets are held for recipient.
 func (q *Queue) Len(recipient peer.ID) int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return len(q.items[recipient])
 }
 
-// Bytes reports the memory held by every queued packet.
 func (q *Queue) Bytes() int64 {
 	q.mu.Lock()
 	defer q.mu.Unlock()

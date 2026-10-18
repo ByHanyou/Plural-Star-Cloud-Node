@@ -70,8 +70,6 @@ func (s *Server) SetRelay(m *relay.Manager) { s.relay = m }
 
 func (s *Server) SetNetworks(store *network.Store) { s.networks = store }
 
-// SetCloud attaches the cloud services. Must be called before Start, because
-// the /cloud/* routes are registered when the mux is built.
 func (s *Server) SetCloud(svc *cloud.Service) { s.cloud = svc }
 
 func (s *Server) SetRendezvousGossip(g *relay.RendezvousGossip) {
@@ -130,10 +128,6 @@ func (s *Server) routes() http.Handler {
 	return mux
 }
 
-// startDebugServer exposes pprof on its own loopback-only listener when
-// debug_addr is set. It is never attached to the main mux: that one binds
-// 0.0.0.0 in production, and pprof there would serve heap and goroutine dumps
-// to the internet. Non-loopback addresses are refused rather than trusted.
 func (s *Server) startDebugServer() {
 	addr := strings.TrimSpace(s.cfg.DebugAddr)
 	if addr == "" {

@@ -22,14 +22,8 @@ var ErrNoRoute = errors.New("recipient not found in routing table")
 
 type DeliverFunc func(*Packet)
 
-// OfflineFunc holds a packet for a recipient that cannot be reached right now.
-// It returns true when it accepted the packet; false leaves the packet with the
-// in-memory queue, so a relay without a persistent store behaves exactly as it
-// always has.
 type OfflineFunc func(recipient peer.ID, p *Packet) bool
 
-// OfflineReplayFunc hands every packet parked for recipient to deliver, oldest
-// first, dropping each one deliver accepts, and reports how many it delivered.
 type OfflineReplayFunc func(recipient peer.ID, deliver func(*Packet) bool) int
 
 type Manager struct {
@@ -84,24 +78,18 @@ func NewManager(ctx context.Context, h host.Host, ps *pubsub.PubSub, gossipPrefi
 
 func (m *Manager) Router() *Router { return m.router }
 
-// SetOffline installs the persistent store for undeliverable packets. A nil
-// function restores the in-memory queue as the only holding place.
 func (m *Manager) SetOffline(f OfflineFunc) {
 	m.offlineMu.Lock()
 	m.offline = f
 	m.offlineMu.Unlock()
 }
 
-// SetOfflineReplay installs the drain for the persistent store, used when a
-// recipient comes online through another node.
 func (m *Manager) SetOfflineReplay(f OfflineReplayFunc) {
 	m.offlineMu.Lock()
 	m.replay = f
 	m.offlineMu.Unlock()
 }
 
-// hold parks a packet that could not be delivered or forwarded. The persistent
-// store gets first refusal; the in-memory queue takes whatever it declines.
 func (m *Manager) hold(recipient peer.ID, p *Packet) {
 	m.offlineMu.RLock()
 	f := m.offline
@@ -112,8 +100,6 @@ func (m *Manager) hold(recipient peer.ID, p *Packet) {
 	m.queue.Put(recipient, p)
 }
 
-// FlushQueued attempts delivery of everything held for recipient. Packets that
-// still cannot be delivered are put back, so nothing is lost by a failed flush.
 func (m *Manager) FlushQueued(recipient peer.ID) {
 	pending := m.queue.Take(recipient)
 	m.mu.RLock()

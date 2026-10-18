@@ -92,9 +92,6 @@ func (m *Manager) Nodes() []NodeInfo {
 		m.mu.RLock()
 		rtt := m.rtts[p]
 		m.mu.RUnlock()
-		// Roles and the push box key arrive through identify as the peer's
-		// AgentVersion. A peer that predates the cloud role, or whose identify
-		// has not completed yet, parses to the plain relay role.
 		agent := ""
 		if v, err := m.h.Peerstore().Get(p, "AgentVersion"); err == nil {
 			if s, ok := v.(string); ok {

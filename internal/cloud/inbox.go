@@ -20,9 +20,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-// Inbox is the store-and-forward queue: one directory per recipient, one file
-// per packet, named <arrival ms>-<packet id>.pkt so replay is oldest first and
-// a repeated packet id lands on the same name.
 type Inbox struct {
 	dir string
 	cfg config.CloudConfig
@@ -30,23 +27,13 @@ type Inbox struct {
 	mu    sync.Mutex
 	locks map[peer.ID]*sync.Mutex
 
-	// full reports whether the disk is at the watermark.
 	full func() bool
 
-	// Live packet count for /health. It used to be computed by walking every
-	// recipient directory and stat-ing every file on EVERY request, and since
-	// the apps call /health on every wake that walk grew with the inbox until a
-	// single request took seconds and allocated hundreds of MB. Concurrent
-	// requests then piled up and the node was OOM-killed (2026-09-14). Kept as
-	// a counter instead, maintained on write and delete and reconciled by
-	// sweep, which already walks the whole tree for its own reasons.
 	pkts atomic.Int64
 }
 
 func newInbox(dir string, cfg config.CloudConfig) *Inbox {
 	ib := &Inbox{dir: dir, cfg: cfg, locks: make(map[peer.ID]*sync.Mutex)}
-	// One walk at startup to seed the counter. Bounded, off the request path,
-	// and it drops anything already expired while it is in there.
 	ib.sweep()
 	return ib
 }
@@ -123,7 +110,6 @@ func (ib *Inbox) list(p peer.ID) []inboxFile {
 	return out
 }
 
-// Store keeps p for recipient. Returns false when it could not be stored.
 func (ib *Inbox) Store(recipient peer.ID, p *relay.Packet) bool {
 	raw, err := p.Marshal()
 	if err != nil {
@@ -179,9 +165,6 @@ func (ib *Inbox) Store(recipient peer.ID, p *relay.Packet) bool {
 	return true
 }
 
-// Replay hands every stored packet for recipient to deliver, oldest first, and
-// removes each one deliver accepted. deliver returns false to stop (the socket
-// is gone); what remains stays for the next connect.
 func (ib *Inbox) Replay(recipient peer.ID, deliver func(*relay.Packet) bool) int {
 	unlock := ib.lock(recipient)
 	defer unlock()
@@ -221,7 +204,6 @@ func (ib *Inbox) Replay(recipient peer.ID, deliver func(*relay.Packet) bool) int
 	return n
 }
 
-// Take returns and removes everything stored for recipient (the HTTP replay).
 func (ib *Inbox) Take(recipient peer.ID) []*relay.Packet {
 	var out []*relay.Packet
 	ib.Replay(recipient, func(p *relay.Packet) bool {
@@ -231,7 +213,6 @@ func (ib *Inbox) Take(recipient peer.ID) []*relay.Packet {
 	return out
 }
 
-// count is O(1): see the note on Inbox.pkts. Never walk the tree here.
 func (ib *Inbox) count() int {
 	n := ib.pkts.Load()
 	if n < 0 {
@@ -240,10 +221,6 @@ func (ib *Inbox) count() int {
 	return int(n)
 }
 
-// sweep drops expired packets and empty recipient directories. It walks the
-// whole tree anyway, so it also recomputes the packet counter from what it
-// actually sees: any drift from a missed path or a crash mid-write is corrected
-// on the next pass rather than accumulating for ever.
 func (ib *Inbox) sweep() {
 	entries, err := os.ReadDir(ib.dir)
 	if err != nil {
@@ -257,11 +234,6 @@ func (ib *Inbox) sweep() {
 		}
 		p, err := peer.Decode(e.Name())
 		if err != nil {
-			// Not a recipient directory we can lock and expire, but anything
-			// in it is still on disk and still ours to report. Counting it
-			// separately keeps the reconcile honest: tying the count to
-			// whether the name decodes would silently zero out a stray
-			// directory and leave the counter reading low for ever.
 			seen += int64(countPkts(filepath.Join(ib.dir, e.Name())))
 			continue
 		}
@@ -284,8 +256,6 @@ func (ib *Inbox) sweep() {
 	ib.pkts.Store(seen)
 }
 
-// countPkts counts packet files in one directory. Only used by sweep, which is
-// off the request path; count() must never do this.
 func countPkts(dir string) int {
 	ents, err := os.ReadDir(dir)
 	if err != nil {

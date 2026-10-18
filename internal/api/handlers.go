@@ -241,22 +241,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	s.broadcast(peerOnlineEvent{Type: "peer_online", PeerID: appPeer.String(), ViaNode: s.h.ID().String()})
 
-	// Deliver to EVERY client connected under this peer ID, not just the socket
-	// that happened to register last. Linked devices share one identity, so one
-	// address legitimately has several live connections and all of them must
-	// receive. This also survives the registering socket closing while siblings
-	// remain, since the relay slot no longer captures a single client.
 	s.relay.AppConnected(appPeer, func(p *relay.Packet) {
 		s.sendToApp(appPeer, packetEvent(p))
 	})
 
-	// Store-and-forward replay. Runs after AppConnected so a packet arriving
-	// mid-replay is delivered live rather than parked until the next connect,
-	// and BEFORE the write pump starts so this is the socket's only writer.
-	// Each packet is written directly with a deadline: the buffered send path
-	// drops silently once its 64 slots fill, and Replay deletes on success, so
-	// routing stored packets through it would destroy them. A failed write
-	// stops the replay and whatever remains stays on disk.
 	if s.cloud != nil {
 		replayed := s.cloud.Inbox().Replay(appPeer, func(p *relay.Packet) bool {
 			b, err := json.Marshal(packetEvent(p))

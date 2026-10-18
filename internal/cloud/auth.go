@@ -4,6 +4,7 @@ package cloud
 
 import (
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -29,6 +30,8 @@ const (
 	headerSig        = "X-Ps-Sig"
 	headerTS         = "X-Ps-Ts"
 	headerTier       = "X-Ps-Tier"
+	headerDeviceID   = "X-Ps-Device-Id"
+	headerDeviceKey  = "X-Ps-Device-Key"
 	headerUploadOffs = "Upload-Offset"
 )
 
@@ -92,7 +95,6 @@ func (h identityHeaders) verify(signed string) bool {
 	return freshTS(h.TS) && verifySigned(h.PeerID, h.Pub, h.Sig, signed) && !replays.seenOrAdd(h.Sig)
 }
 
-// replayCache remembers accepted signatures for the freshness window.
 type replayCache struct {
 	mu   sync.Mutex
 	seen map[string]time.Time
@@ -132,12 +134,25 @@ func secretMatches(storedHash, secretHex string) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(storedHash)) == 1
 }
 
+func newDeviceKey() (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(raw), nil
+}
+
+func readDeviceHeaders(r *http.Request) (subID, key string) {
+	subID = strings.TrimSpace(r.Header.Get(headerDeviceID))
+	key = strings.ToLower(strings.TrimSpace(r.Header.Get(headerDeviceKey)))
+	return subID, key
+}
+
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
-	// Only a loopback peer, a reverse proxy on this machine, may set X-Forwarded-For.
 	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			if first := strings.TrimSpace(strings.Split(xff, ",")[0]); first != "" {

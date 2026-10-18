@@ -1,4 +1,3 @@
-# Plural Star Cloud Node — build helpers
 BIN := plural-star-cloud-node
 PKG := ./cmd/node
 DIST := dist
@@ -27,7 +26,6 @@ clean:
 	rm -f $(BIN) $(BIN)-* $(BIN).exe
 	rm -rf $(DIST)
 
-# Cross-compile all release targets (fully static, CGO disabled).
 dist:
 	mkdir -p $(DIST)
 	CGO_ENABLED=0 GOOS=linux   GOARCH=amd64        go build -o $(DIST)/$(BIN)-linux-amd64   $(PKG)

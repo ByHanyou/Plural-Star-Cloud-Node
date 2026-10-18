@@ -70,7 +70,6 @@ func (nd *NetworkDiscovery) readLoop() {
 		if found && card.CreatedAt <= existing.CreatedAt {
 			continue
 		}
-		// A card id belongs to the key that first published it.
 		if found && card.CreatedBy != existing.CreatedBy {
 			continue
 		}

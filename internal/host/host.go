@@ -28,8 +28,6 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
-// LoadIdentity reads an existing keypair and refuses to invent one. Use it
-// wherever the peer ID is already known to the outside world.
 func LoadIdentity(path string) (crypto.PrivKey, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -72,10 +70,6 @@ func LoadOrCreateIdentity(path string) (crypto.PrivKey, error) {
 	return priv, nil
 }
 
-// New builds the libp2p host. agent is advertised through the identify
-// protocol as this node's AgentVersion, which is how mesh peers learn each
-// other's roles and push box key without a second exchange; empty keeps
-// libp2p's default.
 func New(cfg *config.Config, priv crypto.PrivKey, psk []byte, agent string) (host.Host, error) {
 	listen, err := parseMultiaddrs(cfg.ListenAddrs)
 	if err != nil {
@@ -152,9 +146,6 @@ func NewDHT(ctx context.Context, h host.Host, prefix string) (*dht.IpfsDHT, erro
 	return kdht, nil
 }
 
-// ConnectPeers dials every target we are not already connected to and reports
-// how many NEW connections were made. Skipping live connections keeps the
-// reconnect loop's count honest and its log quiet while the mesh is healthy.
 func ConnectPeers(ctx context.Context, h host.Host, infos []peer.AddrInfo) (int, error) {
 	var (
 		mu        sync.Mutex

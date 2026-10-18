@@ -11,17 +11,12 @@ import (
 
 const (
 	gcObjectGrace = 24 * time.Hour
-	// frontMaxAge is how long an unrefreshed front cache entry is kept.
-	frontMaxAge = 30 * 24 * time.Hour
+	frontMaxAge   = 30 * 24 * time.Hour
 )
 
-// runGC is the daily collection from section 7.5: objects no kept manifest
-// references, vaults whose zero-device grace has elapsed, expired inbox
-// packets, and abandoned upload fragments.
 func (s *Service) runGC() {
 	start := time.Now()
 	graceCutoff := start.Add(-time.Duration(s.cfg.GraceDays) * 24 * time.Hour)
-	// These sweeps run even when the object pass below aborts.
 	defer func() {
 		s.objects.sweepParts(gcObjectGrace)
 		s.inbox.sweep()
@@ -30,8 +25,6 @@ func (s *Service) runGC() {
 	}()
 	live, expired, err := s.vaults.liveObjects(graceCutoff)
 	if err != nil {
-		// Collect nothing until every vault reads cleanly, or an unreadable vault's
-		// objects would be deleted as unreferenced.
 		log.Printf("gc: object collection skipped: %v", err)
 		return
 	}

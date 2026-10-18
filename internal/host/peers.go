@@ -16,18 +16,6 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
-// PeerMemory is a small on-disk record of node peers this node has actually
-// held a libp2p connection to, kept so the reconnect loop has more to dial
-// than the static bootstrap list. Without it the bootstrap node is a single
-// point of failure twice over: a node that restarts while the bootstrap is
-// down comes up with zero peers and stays stranded even though the rest of
-// the mesh is alive, and the bootstrap node itself dials nobody after a
-// reboot because its own list contains only its own address. With it, every
-// node redials the mesh it last saw, so the network heals from whichever
-// side comes back first and nobody has to restart anything.
-//
-// This is purely local dial-target state. Nothing here changes the wire
-// protocol, adds a message, or shares new data with anyone.
 const (
 	peerMemoryMaxPeers  = 64
 	peerMemoryMaxAddrs  = 8
@@ -48,9 +36,6 @@ type PeerMemory struct {
 	dirty bool
 }
 
-// LoadPeerMemory reads the remembered-peer file at path. A missing or
-// unreadable file is a fresh start, never an error: this cache is an
-// optimisation and must not be able to stop a node from booting.
 func LoadPeerMemory(path string) *PeerMemory {
 	pm := &PeerMemory{path: path, peers: map[peer.ID]rememberedPeer{}}
 	data, err := os.ReadFile(path)
@@ -72,10 +57,6 @@ func LoadPeerMemory(path string) *PeerMemory {
 	return pm
 }
 
-// Snapshot records every peer the host is connected to right now, with the
-// addresses those connections actually used. Relay-circuit addresses are
-// skipped: a path through another node is exactly what will not exist when
-// that node is the one being redialled.
 func (pm *PeerMemory) Snapshot(h host.Host) {
 	now := time.Now().Unix()
 	pm.mu.Lock()
@@ -85,7 +66,6 @@ func (pm *PeerMemory) Snapshot(h host.Host) {
 		if id == h.ID() {
 			continue
 		}
-		// An inbound remote address is an ephemeral source port and never dialable.
 		if c.Stat().Direction != corenet.DirOutbound {
 			continue
 		}
@@ -109,9 +89,6 @@ func (pm *PeerMemory) Snapshot(h host.Host) {
 	}
 }
 
-// Save writes the memory to disk if anything changed since the last save,
-// trimming expired entries and capping the file at the most recently seen
-// peers. Failures are swallowed for the same reason load failures are.
 func (pm *PeerMemory) Save() {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
@@ -145,9 +122,6 @@ func (pm *PeerMemory) Save() {
 	}
 }
 
-// DialTargets returns remembered peers as dialable AddrInfos, excluding self
-// and anything expired. Order is most recently seen first so the cap in the
-// caller lands on the freshest addresses.
 func (pm *PeerMemory) DialTargets(self peer.ID) []peer.AddrInfo {
 	cutoff := time.Now().Add(-peerMemoryTTL).Unix()
 	pm.mu.Lock()
@@ -186,10 +160,6 @@ func (pm *PeerMemory) DialTargets(self peer.ID) []peer.AddrInfo {
 	return out
 }
 
-// MergeTargets folds remembered peers into a bootstrap-derived target list,
-// deduplicating by peer ID. Bootstrap entries come first and win the dedupe:
-// their addresses are operator-vouched DNS names, while remembered addresses
-// may be stale NAT observations.
 func MergeTargets(bootstrap []peer.AddrInfo, remembered []peer.AddrInfo) []peer.AddrInfo {
 	seen := make(map[peer.ID]bool, len(bootstrap)+len(remembered))
 	out := make([]peer.AddrInfo, 0, len(bootstrap)+len(remembered))

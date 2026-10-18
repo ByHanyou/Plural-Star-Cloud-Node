@@ -12,7 +12,6 @@ User=plural-star
 WorkingDirectory=/var/lib/plural-star-cloud-node
 Environment=GOMEMLIMIT=2500MiB
 
-# Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

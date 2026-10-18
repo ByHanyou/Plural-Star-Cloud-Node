@@ -116,8 +116,6 @@ func (p *pushRelay) publicKeyB64() string {
 
 func (p *pushRelay) enabled() bool { return p.cfg.PushForwardURL != "" }
 
-// unseal opens a request sealed to this node's box key. Wire form: nonce (24
-// bytes) followed by the box, base64; the sender's box public key alongside.
 func (p *pushRelay) unseal(sealedB64, senderPubB64 string) ([]byte, error) {
 	sealed, err := base64.StdEncoding.DecodeString(sealedB64)
 	if err != nil || len(sealed) <= 24 {
@@ -198,8 +196,6 @@ func (p *pushRelay) forwardLoop() {
 	}
 }
 
-// drain forwards queued items oldest first. Returns false when the gateway
-// could not be reached, so the loop backs off instead of spinning.
 func (p *pushRelay) drain() bool {
 	entries, err := os.ReadDir(p.queueDir)
 	if err != nil {
@@ -240,7 +236,6 @@ func (p *pushRelay) drain() bool {
 			_ = os.Remove(path)
 			continue
 		}
-		// A 5xx leaves this packet for the next pass without blocking the rest.
 		allDone = false
 	}
 	return allDone

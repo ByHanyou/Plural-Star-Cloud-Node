@@ -11,9 +11,6 @@ import (
 	"time"
 )
 
-// FrontEntry mirrors the gateway's cache record so a reader can rebuild the
-// same rows either way. Readers is the author's signed reader list; an entry
-// with no list is readable by nobody.
 type FrontEntry struct {
 	Fronters    string   `json:"fronters"`
 	StartTime   int64    `json:"start_time"`
@@ -59,7 +56,6 @@ func (f *frontStore) Get(peerID string) (FrontEntry, bool) {
 	return e, true
 }
 
-// sweep removes entries nobody has refreshed for maxAge.
 func (f *frontStore) sweep(maxAge time.Duration) int {
 	entries, err := os.ReadDir(f.dir)
 	if err != nil {

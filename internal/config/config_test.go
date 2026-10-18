@@ -87,8 +87,6 @@ func TestLoadFirstRunWritesFileAndLeavesAuthOpen(t *testing.T) {
 	if !firstRun {
 		t.Fatal("expected firstRun=true on a fresh path")
 	}
-	// A default node is public, and a public node must stay open: app users on
-	// the default network have no token, and every endpoint is behind auth.
 	if cfg.APIToken != "" {
 		t.Fatalf("first run must leave api_token empty, got %q", cfg.APIToken)
 	}
@@ -105,9 +103,6 @@ func TestLoadFirstRunWritesFileAndLeavesAuthOpen(t *testing.T) {
 	}
 }
 
-// A token that finds its way into a public node's config is stripped on load
-// AND rewritten to disk, so it cannot survive to lock the network out again on
-// the next boot. This is the 2026-07-31 outage, made unrepeatable.
 func TestLoadStripsAPITokenFromPublicConfigAndPersists(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	seed := Default()
@@ -133,8 +128,6 @@ func TestLoadStripsAPITokenFromPublicConfigAndPersists(t *testing.T) {
 	}
 }
 
-// Operator-run networks are not the default network, so a token there is a
-// deliberate choice and must be left alone.
 func TestLoadKeepsAPITokenOnPrivateNetwork(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	seed := Default()

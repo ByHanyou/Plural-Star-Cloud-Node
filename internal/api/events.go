@@ -30,9 +30,3 @@ type packetReceivedEvent struct {
 	Payload      string `json:"payload"`
 	Timestamp    int64  `json:"timestamp"`
 }
-
-type errorEvent struct {
-	Type    string `json:"type"`
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}

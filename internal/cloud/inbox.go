@@ -5,18 +5,18 @@ package cloud
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/config"
 	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/relay"
+
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -24,8 +24,7 @@ type Inbox struct {
 	dir string
 	cfg config.CloudConfig
 
-	mu    sync.Mutex
-	locks map[peer.ID]*sync.Mutex
+	locks *keyedMutex[peer.ID]
 
 	full func() bool
 
@@ -33,21 +32,9 @@ type Inbox struct {
 }
 
 func newInbox(dir string, cfg config.CloudConfig) *Inbox {
-	ib := &Inbox{dir: dir, cfg: cfg, locks: make(map[peer.ID]*sync.Mutex)}
+	ib := &Inbox{dir: dir, cfg: cfg, locks: newKeyedMutex[peer.ID]()}
 	ib.sweep()
 	return ib
-}
-
-func (ib *Inbox) lock(p peer.ID) func() {
-	ib.mu.Lock()
-	m, ok := ib.locks[p]
-	if !ok {
-		m = &sync.Mutex{}
-		ib.locks[p] = m
-	}
-	ib.mu.Unlock()
-	m.Lock()
-	return m.Unlock
 }
 
 func (ib *Inbox) ttl() time.Duration { return time.Duration(ib.cfg.InboxTTLDays) * 24 * time.Hour }
@@ -73,10 +60,7 @@ func senderTag(sender []byte) string {
 }
 
 func (ib *Inbox) list(p peer.ID) []inboxFile {
-	entries, err := os.ReadDir(ib.recipientDir(p))
-	if err != nil {
-		return nil
-	}
+	entries := listDir(ib.recipientDir(p))
 	var out []inboxFile
 	for _, e := range entries {
 		name := e.Name()
@@ -113,6 +97,7 @@ func (ib *Inbox) list(p peer.ID) []inboxFile {
 func (ib *Inbox) Store(recipient peer.ID, p *relay.Packet) bool {
 	raw, err := p.Marshal()
 	if err != nil {
+		slog.Warn("inbox: encoding packet failed", "recipient", recipient, "err", err)
 		return false
 	}
 	if int64(len(raw)) > ib.quota() {
@@ -121,11 +106,11 @@ func (ib *Inbox) Store(recipient peer.ID, p *relay.Packet) bool {
 	if ib.full != nil && ib.full() {
 		return false
 	}
-	unlock := ib.lock(recipient)
+	unlock := ib.locks.lock(recipient)
 	defer unlock()
 	dir := ib.recipientDir(recipient)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		log.Printf("inbox: create %s: %v", dir, err)
+		slog.Warn("inbox: create directory failed", "dir", dir, "err", err)
 		return false
 	}
 	id := hex.EncodeToString(p.ID[:])
@@ -137,8 +122,9 @@ func (ib *Inbox) Store(recipient peer.ID, p *relay.Packet) bool {
 	kept := files[:0]
 	for _, f := range files {
 		if f.id == id || f.at.Before(cutoff) || (from != "" && f.from == from) {
-			_ = os.Remove(filepath.Join(dir, f.name))
-			dropped++
+			if removeFile(filepath.Join(dir, f.name)) {
+				dropped++
+			}
 			continue
 		}
 		total += f.size
@@ -146,8 +132,9 @@ func (ib *Inbox) Store(recipient peer.ID, p *relay.Packet) bool {
 	}
 	for len(kept) > 0 && total+int64(len(raw)) > ib.quota() {
 		oldest := kept[0]
-		_ = os.Remove(filepath.Join(dir, oldest.name))
-		dropped++
+		if removeFile(filepath.Join(dir, oldest.name)) {
+			dropped++
+		}
 		total -= oldest.size
 		kept = kept[1:]
 	}
@@ -157,7 +144,7 @@ func (ib *Inbox) Store(recipient peer.ID, p *relay.Packet) bool {
 	}
 	name += ".pkt"
 	if err := writeAtomic(filepath.Join(dir, name), raw); err != nil {
-		log.Printf("inbox: store for %s: %v", recipient, err)
+		slog.Warn("inbox: store failed", "recipient", recipient, "err", err)
 		ib.pkts.Add(-dropped)
 		return false
 	}
@@ -166,7 +153,7 @@ func (ib *Inbox) Store(recipient peer.ID, p *relay.Packet) bool {
 }
 
 func (ib *Inbox) Replay(recipient peer.ID, deliver func(*relay.Packet) bool) int {
-	unlock := ib.lock(recipient)
+	unlock := ib.locks.lock(recipient)
 	defer unlock()
 	dir := ib.recipientDir(recipient)
 	files := ib.list(recipient)
@@ -176,30 +163,35 @@ func (ib *Inbox) Replay(recipient peer.ID, deliver func(*relay.Packet) bool) int
 	for _, f := range files {
 		path := filepath.Join(dir, f.name)
 		if f.at.Before(cutoff) {
-			_ = os.Remove(path)
-			gone++
+			if removeFile(path) {
+				gone++
+			}
 			continue
 		}
 		raw, err := os.ReadFile(path)
 		if err != nil {
+			slog.Warn("inbox: reading packet failed", "file", path, "err", err)
 			continue
 		}
 		p, err := relay.UnmarshalPacket(raw)
 		if err != nil {
-			_ = os.Remove(path)
-			gone++
+			slog.Warn("inbox: dropping unreadable packet", "file", path, "err", err)
+			if removeFile(path) {
+				gone++
+			}
 			continue
 		}
 		if !deliver(p) {
 			break
 		}
-		_ = os.Remove(path)
-		gone++
+		if removeFile(path) {
+			gone++
+		}
 		n++
 	}
 	ib.pkts.Add(-gone)
 	if len(ib.list(recipient)) == 0 {
-		_ = os.Remove(dir)
+		removeFile(dir)
 	}
 	return n
 }
@@ -222,10 +214,7 @@ func (ib *Inbox) count() int {
 }
 
 func (ib *Inbox) sweep() {
-	entries, err := os.ReadDir(ib.dir)
-	if err != nil {
-		return
-	}
+	entries := listDir(ib.dir)
 	cutoff := time.Now().Add(-ib.ttl())
 	seen := int64(0)
 	for _, e := range entries {
@@ -237,18 +226,17 @@ func (ib *Inbox) sweep() {
 			seen += int64(countPkts(filepath.Join(ib.dir, e.Name())))
 			continue
 		}
-		unlock := ib.lock(p)
+		unlock := ib.locks.lock(p)
 		dir := ib.recipientDir(p)
 		remaining := 0
 		for _, f := range ib.list(p) {
-			if f.at.Before(cutoff) {
-				_ = os.Remove(filepath.Join(dir, f.name))
+			if f.at.Before(cutoff) && removeFile(filepath.Join(dir, f.name)) {
 				continue
 			}
 			remaining++
 		}
 		if remaining == 0 {
-			_ = os.Remove(dir)
+			removeFile(dir)
 		}
 		seen += int64(remaining)
 		unlock()
@@ -257,10 +245,7 @@ func (ib *Inbox) sweep() {
 }
 
 func countPkts(dir string) int {
-	ents, err := os.ReadDir(dir)
-	if err != nil {
-		return 0
-	}
+	ents := listDir(dir)
 	n := 0
 	for _, f := range ents {
 		if !f.IsDir() && strings.HasSuffix(f.Name(), ".pkt") {

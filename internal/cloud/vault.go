@@ -6,31 +6,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
-	"sort"
-	"strconv"
-	"strings"
-	"sync"
 	"time"
 
 	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/config"
 )
 
 var (
-	ErrVaultExists   = errors.New("vault already exists")
-	ErrVaultMissing  = errors.New("no vault")
-	ErrBadAuth       = errors.New("bad auth secret")
-	ErrVersion       = errors.New("manifest version conflict")
-	ErrQuota         = errors.New("vault quota exceeded")
-	ErrMissingObject = errors.New("manifest references missing objects")
-)
-
-var (
-	ErrDeviceKeyRequired = errors.New("device key required")
-	ErrDeviceUnlinked    = errors.New("device unlinked")
-	ErrDeviceKeyIssued   = errors.New("device key already issued")
+	ErrVaultExists  = errors.New("vault already exists")
+	ErrVaultMissing = errors.New("no vault")
+	ErrBadAuth      = errors.New("bad auth secret")
+	ErrQuota        = errors.New("vault quota exceeded")
 )
 
 type ObjRef struct {
@@ -44,27 +31,8 @@ type pendingRef struct {
 	At int64 `json:"at,omitempty"`
 }
 
-func (p pendingRef) expired(now time.Time) bool {
-	return p.At <= 0 || now.Sub(time.UnixMilli(p.At)) > gcObjectGrace
-}
-
-type Device struct {
-	SubID    string `json:"sub_id"`
-	Label    string `json:"label"`
-	LastSeen int64  `json:"last_seen"`
-}
-
-type deviceEntry struct {
-	Device
-	KeyHash string `json:"key_hash,omitempty"`
-}
-
-func publicDevices(entries []deviceEntry) []Device {
-	out := make([]Device, 0, len(entries))
-	for _, e := range entries {
-		out = append(out, e.Device)
-	}
-	return out
+func (p pendingRef) expired(now time.Time, grace time.Duration) bool {
+	return p.At <= 0 || now.Sub(time.UnixMilli(p.At)) > grace
 }
 
 type vaultMeta struct {
@@ -89,43 +57,27 @@ type VaultInfo struct {
 	Quota            map[string]int64 `json:"quota"`
 }
 
-type Manifest struct {
-	Version    int64    `json:"version"`
-	Ciphertext []byte   `json:"ciphertext"`
-	Objects    []ObjRef `json:"objects"`
-}
-
 type vaultStore struct {
 	dir     string
 	cfg     config.CloudConfig
 	objects *objectStore
-
-	mu    sync.Mutex
-	locks map[string]*sync.Mutex
+	locks   *keyedMutex[string]
+	grace   time.Duration
 }
 
-func newVaultStore(root string, cfg config.CloudConfig, objects *objectStore) *vaultStore {
+func newVaultStore(root string, cfg config.CloudConfig, objects *objectStore, grace time.Duration) *vaultStore {
 	return &vaultStore{
 		dir:     filepath.Join(root, "vaults"),
 		cfg:     cfg,
 		objects: objects,
-		locks:   make(map[string]*sync.Mutex),
+		locks:   newKeyedMutex[string](),
+		grace:   grace,
 	}
-}
-
-func (v *vaultStore) lock(id string) func() {
-	v.mu.Lock()
-	m, ok := v.locks[id]
-	if !ok {
-		m = &sync.Mutex{}
-		v.locks[id] = m
-	}
-	v.mu.Unlock()
-	m.Lock()
-	return m.Unlock
 }
 
 func (v *vaultStore) path(id string) string { return filepath.Join(v.dir, id) }
+
+func (v *vaultStore) metaPath(id string) string { return filepath.Join(v.path(id), "vault.json") }
 
 func (v *vaultStore) quota(tier string) int64 {
 	if tier == TierMedia {
@@ -134,25 +86,10 @@ func (v *vaultStore) quota(tier string) int64 {
 	return int64(v.cfg.BaseQuotaMB) << 20
 }
 
-func (v *vaultStore) count() int {
-	entries, err := os.ReadDir(v.dir)
-	if err != nil {
-		return 0
-	}
-	n := 0
-	for _, e := range entries {
-		if e.IsDir() && validHex32(e.Name()) {
-			n++
-		}
-	}
-	return n
-}
+func (v *vaultStore) count() int { return len(v.ids()) }
 
 func (v *vaultStore) ids() []string {
-	entries, err := os.ReadDir(v.dir)
-	if err != nil {
-		return nil
-	}
+	entries := listDir(v.dir)
 	var out []string
 	for _, e := range entries {
 		if e.IsDir() && validHex32(e.Name()) {
@@ -163,14 +100,14 @@ func (v *vaultStore) ids() []string {
 }
 
 func (v *vaultStore) exists(id string) bool {
-	_, err := os.Stat(filepath.Join(v.path(id), "vault.json"))
+	_, err := os.Stat(v.metaPath(id))
 	return err == nil
 }
 
 func (v *vaultStore) readMeta(id string) (*vaultMeta, error) {
-	raw, err := os.ReadFile(filepath.Join(v.path(id), "vault.json"))
+	raw, err := os.ReadFile(v.metaPath(id))
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil, ErrVaultMissing
 		}
 		return nil, err
@@ -199,7 +136,7 @@ func (v *vaultStore) writeMeta(id string, m *vaultMeta) error {
 	if err != nil {
 		return err
 	}
-	return writeAtomic(filepath.Join(v.path(id), "vault.json"), raw)
+	return writeAtomic(v.metaPath(id), raw)
 }
 
 func (v *vaultStore) authed(id, secret string) (*vaultMeta, error) {
@@ -214,7 +151,7 @@ func (v *vaultStore) authed(id, secret string) (*vaultMeta, error) {
 }
 
 func (v *vaultStore) Create(id, secret, wrappedMasterKey string) error {
-	unlock := v.lock(id)
+	unlock := v.locks.lock(id)
 	defer unlock()
 	if v.exists(id) {
 		return ErrVaultExists
@@ -233,24 +170,6 @@ func (v *vaultStore) Create(id, secret, wrappedMasterKey string) error {
 	return v.writeMeta(id, m)
 }
 
-func (v *vaultStore) refs(id string, version int64) ([]ObjRef, error) {
-	if version <= 0 {
-		return nil, nil
-	}
-	raw, err := os.ReadFile(filepath.Join(v.path(id), "manifest."+strconv.FormatInt(version, 10)+".refs"))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	var refs []ObjRef
-	if err := json.Unmarshal(raw, &refs); err != nil {
-		return nil, err
-	}
-	return refs, nil
-}
-
 func (v *vaultStore) usage(id string, m *vaultMeta) (map[string]int64, map[string]ObjRef, error) {
 	refs, err := v.refs(id, m.Version)
 	if err != nil {
@@ -262,7 +181,7 @@ func (v *vaultStore) usage(id string, m *vaultMeta) (map[string]int64, map[strin
 	}
 	now := time.Now()
 	for _, p := range m.Pending {
-		if p.expired(now) {
+		if p.expired(now, v.grace) {
 			continue
 		}
 		if _, seen := known[p.ID]; !seen {
@@ -274,7 +193,7 @@ func (v *vaultStore) usage(id string, m *vaultMeta) (map[string]int64, map[strin
 		use[r.Tier] += r.Size
 	}
 	if m.Version > 0 {
-		if st, serr := os.Stat(filepath.Join(v.path(id), "manifest."+strconv.FormatInt(m.Version, 10))); serr == nil {
+		if st, serr := os.Stat(v.manifestPath(id, m.Version)); serr == nil {
 			use[TierBase] += st.Size()
 		}
 	}
@@ -282,7 +201,7 @@ func (v *vaultStore) usage(id string, m *vaultMeta) (map[string]int64, map[strin
 }
 
 func (v *vaultStore) Info(id, secret string) (*VaultInfo, error) {
-	unlock := v.lock(id)
+	unlock := v.locks.lock(id)
 	defer unlock()
 	m, err := v.authed(id, secret)
 	if err != nil {
@@ -305,7 +224,7 @@ func (v *vaultStore) Info(id, secret string) (*VaultInfo, error) {
 }
 
 func (v *vaultStore) ReserveObject(id, secret, objID, tier string, size int64) error {
-	unlock := v.lock(id)
+	unlock := v.locks.lock(id)
 	defer unlock()
 	m, err := v.authed(id, secret)
 	if err != nil {
@@ -325,7 +244,7 @@ func (v *vaultStore) ReserveObject(id, secret, objID, tier string, size int64) e
 }
 
 func (v *vaultStore) CommitObject(id, secret string, ref ObjRef) error {
-	unlock := v.lock(id)
+	unlock := v.locks.lock(id)
 	defer unlock()
 	m, err := v.authed(id, secret)
 	if err != nil {
@@ -336,7 +255,7 @@ func (v *vaultStore) CommitObject(id, secret string, ref ObjRef) error {
 }
 
 func (v *vaultStore) Owns(id, secret, objID string) (bool, error) {
-	unlock := v.lock(id)
+	unlock := v.locks.lock(id)
 	defer unlock()
 	m, err := v.authed(id, secret)
 	if err != nil {
@@ -350,271 +269,8 @@ func (v *vaultStore) Owns(id, secret, objID string) (bool, error) {
 	return ok, nil
 }
 
-func (v *vaultStore) GetManifest(id, secret string, version int64) (*Manifest, string, error) {
-	unlock := v.lock(id)
-	defer unlock()
-	m, err := v.authed(id, secret)
-	if err != nil {
-		return nil, "", err
-	}
-	if version <= 0 {
-		version = m.Version
-	}
-	if version <= 0 {
-		return &Manifest{Version: 0}, m.WrappedMasterKey, nil
-	}
-	raw, err := os.ReadFile(filepath.Join(v.path(id), "manifest."+strconv.FormatInt(version, 10)))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, "", ErrNotFound
-		}
-		return nil, "", err
-	}
-	refs, err := v.refs(id, version)
-	if err != nil {
-		return nil, "", err
-	}
-	if refs == nil {
-		refs = []ObjRef{}
-	}
-	return &Manifest{Version: version, Ciphertext: raw, Objects: refs}, m.WrappedMasterKey, nil
-}
-
-type missingError struct{ IDs []string }
-
-func (e *missingError) Error() string { return ErrMissingObject.Error() }
-func (e *missingError) Unwrap() error { return ErrMissingObject }
-
-type versionError struct{ Current int64 }
-
-func (e *versionError) Error() string { return ErrVersion.Error() }
-func (e *versionError) Unwrap() error { return ErrVersion }
-
-func (v *vaultStore) PutManifest(id, secret string, expected int64, ciphertext []byte, refs []ObjRef) (int64, error) {
-	unlock := v.lock(id)
-	defer unlock()
-	m, err := v.authed(id, secret)
-	if err != nil {
-		return 0, err
-	}
-	if expected != m.Version {
-		return m.Version, &versionError{Current: m.Version}
-	}
-	use := map[string]int64{TierBase: 0, TierMedia: 0}
-	seen := make(map[string]struct{}, len(refs))
-	var missing []string
-	clean := make([]ObjRef, 0, len(refs))
-	for _, r := range refs {
-		if !validHex32(r.ID) {
-			return m.Version, fmt.Errorf("invalid object id %q", r.ID)
-		}
-		if r.Tier != TierBase && r.Tier != TierMedia {
-			return m.Version, fmt.Errorf("invalid tier %q for object %s", r.Tier, r.ID)
-		}
-		if _, dup := seen[r.ID]; dup {
-			continue
-		}
-		seen[r.ID] = struct{}{}
-		size, _, herr := v.objects.Head(r.ID)
-		if herr != nil {
-			if errors.Is(herr, ErrNotFound) {
-				missing = append(missing, r.ID)
-				continue
-			}
-			return m.Version, herr
-		}
-		r.Size = size
-		use[r.Tier] += size
-		clean = append(clean, r)
-	}
-	if len(missing) > 0 {
-		return m.Version, &missingError{IDs: missing}
-	}
-	use[TierBase] += int64(len(ciphertext))
-	for tier, used := range use {
-		if used > v.quota(tier) {
-			return m.Version, ErrQuota
-		}
-	}
-	next := m.Version + 1
-	base := filepath.Join(v.path(id), "manifest."+strconv.FormatInt(next, 10))
-	refsRaw, err := json.Marshal(clean)
-	if err != nil {
-		return m.Version, err
-	}
-	if err := writeAtomic(base+".refs", refsRaw); err != nil {
-		return m.Version, err
-	}
-	if err := writeAtomic(base, ciphertext); err != nil {
-		_ = os.Remove(base + ".refs")
-		return m.Version, err
-	}
-	m.Version = next
-	m.Pending = make(map[string]pendingRef)
-	if err := v.writeMeta(id, m); err != nil {
-		return m.Version, err
-	}
-	v.pruneManifests(id, next)
-	return next, nil
-}
-
-func (v *vaultStore) pruneManifests(id string, latest int64) {
-	keep := int64(v.cfg.ManifestVersions)
-	if keep <= 0 {
-		keep = 1
-	}
-	entries, err := os.ReadDir(v.path(id))
-	if err != nil {
-		return
-	}
-	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasPrefix(name, "manifest.") {
-			continue
-		}
-		rest := strings.TrimPrefix(name, "manifest.")
-		rest = strings.TrimSuffix(rest, ".refs")
-		ver, perr := strconv.ParseInt(rest, 10, 64)
-		if perr != nil {
-			continue
-		}
-		if ver <= latest-keep {
-			_ = os.Remove(filepath.Join(v.path(id), name))
-		}
-	}
-}
-
-func (v *vaultStore) keptVersions(id string) []int64 {
-	entries, err := os.ReadDir(v.path(id))
-	if err != nil {
-		return nil
-	}
-	var out []int64
-	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasPrefix(name, "manifest.") || !strings.HasSuffix(name, ".refs") {
-			continue
-		}
-		ver, perr := strconv.ParseInt(strings.TrimSuffix(strings.TrimPrefix(name, "manifest."), ".refs"), 10, 64)
-		if perr == nil {
-			out = append(out, ver)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out
-}
-
-func (v *vaultStore) LinkDevice(id, secret, subID, label string) ([]Device, string, bool, error) {
-	unlock := v.lock(id)
-	defer unlock()
-	m, err := v.authed(id, secret)
-	if err != nil {
-		return nil, "", false, err
-	}
-	key, err := newDeviceKey()
-	if err != nil {
-		return nil, "", false, err
-	}
-	keyHash := hashSecret(key)
-	now := time.Now().UnixMilli()
-	found := false
-	for i := range m.Devices {
-		if m.Devices[i].SubID == subID {
-			m.Devices[i].Label = label
-			m.Devices[i].LastSeen = now
-			m.Devices[i].KeyHash = keyHash
-			found = true
-		}
-	}
-	if !found {
-		m.Devices = append(m.Devices, deviceEntry{Device: Device{SubID: subID, Label: label, LastSeen: now}, KeyHash: keyHash})
-	}
-	m.GraceStartedAt = 0
-	if err := v.writeMeta(id, m); err != nil {
-		return nil, "", false, err
-	}
-	return publicDevices(m.Devices), key, found, nil
-}
-
-func (v *vaultStore) IssueDeviceKey(id, secret, subID string) (string, error) {
-	unlock := v.lock(id)
-	defer unlock()
-	m, err := v.authed(id, secret)
-	if err != nil {
-		return "", err
-	}
-	found := false
-	for _, d := range m.Devices {
-		if d.SubID != subID {
-			continue
-		}
-		if d.KeyHash != "" {
-			return "", ErrDeviceKeyIssued
-		}
-		found = true
-	}
-	if !found {
-		return "", ErrDeviceUnlinked
-	}
-	key, err := newDeviceKey()
-	if err != nil {
-		return "", err
-	}
-	keyHash := hashSecret(key)
-	for i := range m.Devices {
-		if m.Devices[i].SubID == subID {
-			m.Devices[i].KeyHash = keyHash
-		}
-	}
-	if err := v.writeMeta(id, m); err != nil {
-		return "", err
-	}
-	return key, nil
-}
-
-func (v *vaultStore) CheckDevice(id, secret, subID, key string) error {
-	unlock := v.lock(id)
-	defer unlock()
-	m, err := v.authed(id, secret)
-	if err != nil {
-		return err
-	}
-	if subID == "" || key == "" {
-		return ErrDeviceKeyRequired
-	}
-	for _, d := range m.Devices {
-		if d.SubID == subID && d.KeyHash != "" && validHex32(key) && secretMatches(d.KeyHash, key) {
-			return nil
-		}
-	}
-	return ErrDeviceUnlinked
-}
-
-func (v *vaultStore) UnlinkDevice(id, secret, subID string) ([]Device, error) {
-	unlock := v.lock(id)
-	defer unlock()
-	m, err := v.authed(id, secret)
-	if err != nil {
-		return nil, err
-	}
-	kept := m.Devices[:0]
-	for _, d := range m.Devices {
-		if d.SubID != subID {
-			kept = append(kept, d)
-		}
-	}
-	m.Devices = kept
-	if len(m.Devices) == 0 && m.GraceStartedAt == 0 {
-		m.GraceStartedAt = time.Now().UnixMilli()
-	}
-	if err := v.writeMeta(id, m); err != nil {
-		return nil, err
-	}
-	return publicDevices(m.Devices), nil
-}
-
 func (v *vaultStore) Rewrap(id, secret, newID, newSecret, wrappedMasterKey string) error {
-	unlock := v.lock(id)
+	unlock := v.locks.lock(id)
 	defer unlock()
 	m, err := v.authed(id, secret)
 	if err != nil {
@@ -629,7 +285,7 @@ func (v *vaultStore) Rewrap(id, secret, newID, newSecret, wrappedMasterKey strin
 	if newID == "" || newID == id {
 		return v.writeMeta(id, m)
 	}
-	unlockNew := v.lock(newID)
+	unlockNew := v.locks.lock(newID)
 	defer unlockNew()
 	if v.exists(newID) {
 		return ErrVaultExists
@@ -641,58 +297,7 @@ func (v *vaultStore) Rewrap(id, secret, newID, newSecret, wrappedMasterKey strin
 }
 
 func (v *vaultStore) Delete(id string) error {
-	unlock := v.lock(id)
+	unlock := v.locks.lock(id)
 	defer unlock()
 	return os.RemoveAll(v.path(id))
-}
-
-func (v *vaultStore) liveObjects(graceCutoff time.Time) (live map[string]struct{}, expiredVaults []string, err error) {
-	live = make(map[string]struct{})
-	now := time.Now()
-	for _, id := range v.ids() {
-		unlock := v.lock(id)
-		m, rerr := v.readMeta(id)
-		if rerr != nil {
-			unlock()
-			if errors.Is(rerr, ErrVaultMissing) {
-				continue
-			}
-			return nil, nil, rerr
-		}
-		graceStart := m.GraceStartedAt
-		if graceStart == 0 {
-			graceStart = m.Updated
-		}
-		if len(m.Devices) == 0 && graceStart > 0 && time.UnixMilli(graceStart).Before(graceCutoff) {
-			expiredVaults = append(expiredVaults, id)
-			unlock()
-			continue
-		}
-		pruned := false
-		for objID, p := range m.Pending {
-			if p.expired(now) {
-				delete(m.Pending, objID)
-				pruned = true
-				continue
-			}
-			live[p.ID] = struct{}{}
-		}
-		if pruned {
-			if werr := v.writeMeta(id, m); werr != nil {
-				log.Printf("gc: prune pending in vault %s: %v", id, werr)
-			}
-		}
-		for _, ver := range v.keptVersions(id) {
-			refs, rerr := v.refs(id, ver)
-			if rerr != nil {
-				unlock()
-				return nil, nil, fmt.Errorf("vault %s manifest %d refs: %w", id, ver, rerr)
-			}
-			for _, r := range refs {
-				live[r.ID] = struct{}{}
-			}
-		}
-		unlock()
-	}
-	return live, expiredVaults, nil
 }

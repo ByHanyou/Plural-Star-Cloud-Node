@@ -11,9 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -35,14 +33,14 @@ type s3Backend struct {
 	client    *http.Client
 }
 
-func newS3Backend(cfg config.CloudConfig) *s3Backend {
+func newS3Backend(cfg config.CloudConfig, timeout time.Duration) *s3Backend {
 	u, err := url.Parse(cfg.S3Endpoint)
 	if err != nil || u.Host == "" {
 		u = &url.URL{Scheme: "https", Host: cfg.S3Endpoint}
 	}
 	region := cfg.S3Region
 	if region == "" {
-		region = "us-east-1"
+		region = config.DefaultS3Region
 	}
 	return &s3Backend{
 		endpoint:  u,
@@ -51,7 +49,7 @@ func newS3Backend(cfg config.CloudConfig) *s3Backend {
 		prefix:    strings.Trim(cfg.S3Prefix, "/"),
 		accessKey: cfg.S3AccessKey,
 		secretKey: cfg.S3SecretKey,
-		client:    &http.Client{Timeout: 10 * time.Minute},
+		client:    &http.Client{Timeout: timeout},
 	}
 }
 
@@ -171,21 +169,7 @@ func (b *s3Backend) Put(id string, r io.Reader, size int64) error {
 }
 
 func (b *s3Backend) PutFile(id string, path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	st, err := f.Stat()
-	if err != nil {
-		_ = f.Close()
-		return err
-	}
-	err = b.Put(id, f, st.Size())
-	_ = f.Close()
-	if err != nil {
-		return err
-	}
-	return os.Remove(path)
+	return putFromPath(id, path, b.Put)
 }
 
 func (b *s3Backend) Get(id string) (io.ReadCloser, int64, error) {
@@ -193,15 +177,7 @@ func (b *s3Backend) Get(id string) (io.ReadCloser, int64, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	if resp.StatusCode == http.StatusNotFound {
-		_ = resp.Body.Close()
-		return nil, 0, ErrNotFound
-	}
-	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
-		return nil, 0, fmt.Errorf("s3 get %s: status %d", id, resp.StatusCode)
-	}
-	return resp.Body, resp.ContentLength, nil
+	return blobGetResult(resp, "s3", id)
 }
 
 func (b *s3Backend) Head(id string) (int64, error) {
@@ -209,15 +185,7 @@ func (b *s3Backend) Head(id string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return 0, ErrNotFound
-	}
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("s3 head %s: status %d", id, resp.StatusCode)
-	}
-	size, _ := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
-	return size, nil
+	return blobHeadResult(resp, "s3", id)
 }
 
 func (b *s3Backend) Delete(id string) error {
@@ -225,11 +193,7 @@ func (b *s3Backend) Delete(id string) error {
 	if err != nil {
 		return err
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
-		return fmt.Errorf("s3 delete %s: status %d", id, resp.StatusCode)
-	}
-	return nil
+	return blobDeleteResult(resp, "s3", id)
 }
 
 type s3ListResult struct {
@@ -279,7 +243,10 @@ func (b *s3Backend) List(fn func(id string, size int64, modified time.Time) erro
 			if !validHex32(id) {
 				continue
 			}
-			modified, _ := time.Parse(time.RFC3339, c.LastModified)
+			modified, perr := time.Parse(time.RFC3339, c.LastModified)
+			if perr != nil {
+				modified = time.Now()
+			}
 			if err := fn(id, c.Size, modified); err != nil {
 				return err
 			}

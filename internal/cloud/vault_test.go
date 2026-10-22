@@ -4,6 +4,7 @@ package cloud
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,9 +16,18 @@ import (
 	"time"
 
 	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/config"
+
+	"golang.org/x/crypto/blake2b"
 )
 
 var testVaultSecret = strings.Repeat("5e", 32)
+
+var testGrace = config.DefaultLimits().GCObjectGrace.Std()
+
+func testHash(b []byte) string {
+	sum := blake2b.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
 
 func newTestVault(t *testing.T, baseQuotaMB int) (*vaultStore, string) {
 	t.Helper()
@@ -35,8 +45,8 @@ func newTestVault(t *testing.T, baseQuotaMB int) (*vaultStore, string) {
 		GraceDays:        30,
 	}
 	objects := newObjectStore(root, newLocalBackend(filepath.Join(root, "objects")), cfg)
-	vs := newVaultStore(root, cfg, objects)
-	id := Hash([]byte("test vault"))
+	vs := newVaultStore(root, cfg, objects, testGrace)
+	id := testHash([]byte("test vault"))
 	if err := vs.Create(id, testVaultSecret, "wrapped-master-key"); err != nil {
 		t.Fatalf("create vault: %v", err)
 	}
@@ -46,13 +56,13 @@ func newTestVault(t *testing.T, baseQuotaMB int) (*vaultStore, string) {
 	return vs, id
 }
 
-func testObjectID(name string) string { return Hash([]byte(name)) }
+func testObjectID(name string) string { return testHash([]byte(name)) }
 
 func storeObject(t *testing.T, vs *vaultStore, name string, size int) string {
 	t.Helper()
 	data := bytes.Repeat([]byte{0x5a}, size)
 	copy(data, name)
-	id := Hash(data)
+	id := testHash(data)
 	if err := vs.objects.local.Put(id, bytes.NewReader(data), int64(size)); err != nil {
 		t.Fatalf("store object: %v", err)
 	}
@@ -193,7 +203,7 @@ func TestPendingWithinGraceCountsTowardQuota(t *testing.T) {
 		t.Fatalf("pending entry keys in vault.json = %s, want at,id,size,tier", got)
 	}
 
-	setPending(t, vs, id, pendingAt(obj, size, time.Now().Add(-gcObjectGrace+time.Minute)))
+	setPending(t, vs, id, pendingAt(obj, size, time.Now().Add(-testGrace+time.Minute)))
 	if got := baseUsage(t, vs, id); got != size {
 		t.Fatalf("base usage = %d, want %d", got, size)
 	}
@@ -218,7 +228,7 @@ func TestPendingPastGraceIsIgnored(t *testing.T) {
 	vs, id := newTestVault(t, 1)
 	const size = 900 << 10
 	obj := storeObject(t, vs, "stale upload", size)
-	setPending(t, vs, id, pendingAt(obj, size, time.Now().Add(-gcObjectGrace-time.Minute)))
+	setPending(t, vs, id, pendingAt(obj, size, time.Now().Add(-testGrace-time.Minute)))
 
 	if got := baseUsage(t, vs, id); got != 0 {
 		t.Fatalf("base usage = %d, want 0", got)
@@ -237,11 +247,11 @@ func TestPendingPastGraceIsIgnored(t *testing.T) {
 		t.Fatal("expired pending object is still live")
 	}
 
-	gc := &Service{}
+	gc := &Service{lim: config.DefaultLimits()}
 	if removed, _ := gc.collectObjects(vs.objects.local, live, time.Now()); removed != 0 {
 		t.Fatalf("GC removed %d object(s) inside the object mtime grace", removed)
 	}
-	old := time.Now().Add(-gcObjectGrace - time.Hour)
+	old := time.Now().Add(-testGrace - time.Hour)
 	if err := os.Chtimes(vs.objects.local.path(obj), old, old); err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +290,7 @@ func TestGCPrunesExpiredPending(t *testing.T) {
 	vs, id := newTestVault(t, 200)
 	now := time.Now()
 	fresh := pendingAt(testObjectID("fresh"), 1000, now.Add(-time.Hour))
-	stale := pendingAt(testObjectID("stale"), 2000, now.Add(-gcObjectGrace-time.Hour))
+	stale := pendingAt(testObjectID("stale"), 2000, now.Add(-testGrace-time.Hour))
 	legacy := ObjRef{ID: testObjectID("legacy"), Tier: TierBase, Size: 3000}
 	setPending(t, vs, id, fresh, stale)
 	addLegacyPending(t, vs, id, legacy)
@@ -390,7 +400,7 @@ func TestExpiredPendingBacklogNoLongerLocksVault(t *testing.T) {
 		seed func(t *testing.T, vs *vaultStore, id string)
 	}{
 		{"past grace", func(t *testing.T, vs *vaultStore, id string) {
-			setPending(t, vs, id, stamped(time.Now().Add(-gcObjectGrace-time.Hour))...)
+			setPending(t, vs, id, stamped(time.Now().Add(-testGrace-time.Hour))...)
 		}},
 		{"untimestamped", func(t *testing.T, vs *vaultStore, id string) {
 			setPending(t, vs, id)
@@ -401,7 +411,7 @@ func TestExpiredPendingBacklogNoLongerLocksVault(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			vs, id := newTestVault(t, 200)
 			small := []byte("a small object uploaded after the app restarted")
-			smallID := Hash(small)
+			smallID := testHash(small)
 
 			setPending(t, vs, id, stamped(time.Now())...)
 			if err := vs.ReserveObject(id, testVaultSecret, smallID, TierBase, int64(len(small))); !errors.Is(err, ErrQuota) {

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 package relay
 
 import (
@@ -77,8 +79,8 @@ func TestRouterUpsertLookupExpire(t *testing.T) {
 	if !ok || got != via {
 		t.Fatalf("lookup failed: ok=%v got=%s want=%s", ok, got, via)
 	}
-	if online := r.Online(); len(online) != 1 || online[0] != target {
-		t.Fatalf("Online mismatch: %v", online)
+	if routes := r.Snapshot(); len(routes) != 1 || routes[0].Peer != target || routes[0].Via != via {
+		t.Fatalf("Snapshot mismatch: %v", routes)
 	}
 
 	time.Sleep(80 * time.Millisecond)
@@ -93,11 +95,9 @@ func TestRouterUpsertLookupExpire(t *testing.T) {
 	}
 }
 
-var _ peer.ID
-
 func TestQueueCaps(t *testing.T) {
-	q := &Queue{items: make(map[peer.ID]map[string]queuedPacket)}
-	big := &Packet{SenderID: []byte("s"), RecipientID: []byte("r"), Payload: make([]byte, QueueMaxBytes/2)}
+	q := &Queue{lim: QueueLimits{EntryTTL: time.Hour, MaxSenders: 500, MaxRecipients: 10000, MaxBytes: 64 << 20, SweepInterval: time.Hour}, items: make(map[peer.ID]map[string]queuedPacket)}
+	big := &Packet{SenderID: []byte("s"), RecipientID: []byte("r"), Payload: make([]byte, q.lim.MaxBytes/2)}
 	if !q.Put(peer.ID("a"), big) {
 		t.Fatal("first packet should fit")
 	}

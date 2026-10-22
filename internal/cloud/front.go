@@ -4,6 +4,8 @@ package cloud
 
 import (
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,22 +49,22 @@ func (f *frontStore) Get(peerID string) (FrontEntry, bool) {
 	raw, err := os.ReadFile(f.path(peerID))
 	f.mu.Unlock()
 	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("cloud: reading front failed", "peer", peerID, "err", err)
+		}
 		return FrontEntry{}, false
 	}
 	var e FrontEntry
-	if json.Unmarshal(raw, &e) != nil {
+	if err := json.Unmarshal(raw, &e); err != nil {
+		slog.Warn("cloud: stored front unreadable", "peer", peerID, "err", err)
 		return FrontEntry{}, false
 	}
 	return e, true
 }
 
-func (f *frontStore) sweep(maxAge time.Duration) int {
-	entries, err := os.ReadDir(f.dir)
-	if err != nil {
-		return 0
-	}
+func (f *frontStore) sweep(maxAge time.Duration) {
+	entries := listDir(f.dir)
 	cutoff := time.Now().Add(-maxAge)
-	removed := 0
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, e := range entries {
@@ -73,17 +75,6 @@ func (f *frontStore) sweep(maxAge time.Duration) int {
 		if ierr != nil || info.ModTime().After(cutoff) {
 			continue
 		}
-		if os.Remove(filepath.Join(f.dir, e.Name())) == nil {
-			removed++
-		}
+		removeFile(filepath.Join(f.dir, e.Name()))
 	}
-	return removed
-}
-
-func (f *frontStore) count() int {
-	entries, err := os.ReadDir(f.dir)
-	if err != nil {
-		return 0
-	}
-	return len(entries)
 }

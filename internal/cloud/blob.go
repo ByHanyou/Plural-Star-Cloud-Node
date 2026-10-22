@@ -25,14 +25,14 @@ type Backend interface {
 	List(fn func(id string, size int64, modified time.Time) error) error
 }
 
-func newBackend(cfg config.CloudConfig, localDir string) (Backend, error) {
+func newBackend(cfg config.CloudConfig, lim config.Limits, localDir string) (Backend, error) {
 	switch cfg.MediaBackend {
 	case config.MediaBackendLocal, "":
 		return newLocalBackend(localDir), nil
 	case config.MediaBackendRemote:
-		return newRemoteBackend(cfg.RemoteBlobURL, cfg.RemoteBlobSecret), nil
+		return newRemoteBackend(cfg.RemoteBlobURL, cfg.RemoteBlobSecret, lim.BlobHTTPTimeout.Std()), nil
 	case config.MediaBackendS3:
-		return newS3Backend(cfg), nil
+		return newS3Backend(cfg, lim.BlobHTTPTimeout.Std()), nil
 	default:
 		return nil, fmt.Errorf("cloud: unknown media backend %q", cfg.MediaBackend)
 	}
@@ -73,16 +73,22 @@ func (b *localBackend) PutFile(id string, path string) error {
 	if err := renameRetry(path, b.path(id)); err == nil {
 		return nil
 	}
+	return putFromPath(id, path, b.Put)
+}
+
+func putFromPath(id, path string, put func(id string, r io.Reader, size int64) error) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 	st, err := f.Stat()
 	if err != nil {
+		_ = f.Close()
 		return err
 	}
-	if err := b.Put(id, f, st.Size()); err != nil {
+	err = put(id, f, st.Size())
+	_ = f.Close()
+	if err != nil {
 		return err
 	}
 	return os.Remove(path)
@@ -91,7 +97,7 @@ func (b *localBackend) PutFile(id string, path string) error {
 func (b *localBackend) Get(id string) (io.ReadCloser, int64, error) {
 	f, err := os.Open(b.path(id))
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil, 0, ErrNotFound
 		}
 		return nil, 0, err
@@ -107,7 +113,7 @@ func (b *localBackend) Get(id string) (io.ReadCloser, int64, error) {
 func (b *localBackend) Head(id string) (int64, error) {
 	st, err := os.Stat(b.path(id))
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return 0, ErrNotFound
 		}
 		return 0, err
@@ -117,7 +123,7 @@ func (b *localBackend) Head(id string) (int64, error) {
 
 func (b *localBackend) Delete(id string) error {
 	err := os.Remove(b.path(id))
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil

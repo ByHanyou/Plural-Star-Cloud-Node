@@ -45,8 +45,8 @@ func LoadPSK(path string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read psk %q: %w", path, err)
 	}
-	if len(data) != 32 {
-		return nil, fmt.Errorf("psk %q must be exactly 32 bytes, got %d", path, len(data))
+	if len(data) != pskLen {
+		return nil, fmt.Errorf("psk %q must be exactly %d bytes, got %d", path, pskLen, len(data))
 	}
 	return data, nil
 }

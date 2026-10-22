@@ -5,21 +5,12 @@ package relay
 import (
 	"crypto/rand"
 	"fmt"
-	"time"
+
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
-const (
-	RelayProtocol = "/plural-star/relay/1.0.0"
-
-	PresenceTTL             = 90 * time.Second
-	MaxPresenceTTL          = 10 * time.Minute
-	PresenceRefreshInterval = 45 * time.Second
-	DedupCacheTTL           = 10 * time.Second
-	DedupCacheEvictInterval = 5 * time.Second
-	RoutingTablePruneTicker = 30 * time.Second
-
-	MaxPacketBytes = 2 << 20
-)
+const RelayProtocol = "/plural-star/relay/1.0.0"
 
 type Packet struct {
 	ID          [16]byte `msgpack:"id"`
@@ -35,4 +26,24 @@ func NewPacketID() ([16]byte, error) {
 		return id, fmt.Errorf("generate packet id: %w", err)
 	}
 	return id, nil
+}
+
+func (p *Packet) Marshal() ([]byte, error) {
+	return msgpack.Marshal(p)
+}
+
+func UnmarshalPacket(b []byte) (*Packet, error) {
+	var p Packet
+	if err := msgpack.Unmarshal(b, &p); err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+func (p *Packet) SenderPeerID() string {
+	sid, err := peer.IDFromBytes(p.SenderID)
+	if err != nil {
+		return ""
+	}
+	return sid.String()
 }

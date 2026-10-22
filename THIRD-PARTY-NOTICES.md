@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-`plural-star-node` is licensed under **AGPL-3.0-or-later** (see `LICENSE`).
+`plural-star-cloud-node` is licensed under **AGPL-3.0-or-later** (see `LICENSE`).
 It is built with the Go modules listed below, each distributed under its own
 license. All are permissive (MIT / BSD / Apache-2.0 / ISC) except three under
 the Mozilla Public License 2.0 (MPL-2.0), a weak, file-level copyleft that is

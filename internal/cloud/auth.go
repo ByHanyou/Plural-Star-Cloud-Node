@@ -22,7 +22,6 @@ import (
 )
 
 const (
-	tsSkew           = 10 * time.Minute
 	headerVaultID    = "X-Vault-Id"
 	headerVaultAuth  = "X-Vault-Auth"
 	headerPeer       = "X-Ps-Peer"
@@ -38,6 +37,8 @@ const (
 var hex32 = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 func validHex32(s string) bool { return hex32.MatchString(s) }
+
+func normalHex(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
 
 func verifySigned(peerID, edPubB64, sigB64, signed string) bool {
 	pub, err := base64.StdEncoding.DecodeString(edPubB64)
@@ -59,16 +60,17 @@ func verifySigned(peerID, edPubB64, sigB64, signed string) bool {
 	return ed25519.Verify(ed25519.PublicKey(pub), []byte(signed), sig)
 }
 
-func freshTS(tsMillis int64) bool {
+func freshTS(tsMillis int64, skew time.Duration) bool {
 	d := time.Since(time.UnixMilli(tsMillis))
 	if d < 0 {
 		d = -d
 	}
-	return d <= tsSkew
+	return d <= skew
 }
 
 type identityHeaders struct {
 	PeerID string
+	ID     peer.ID
 	Pub    string
 	Sig    string
 	TS     int64
@@ -85,14 +87,16 @@ func readIdentityHeaders(r *http.Request) (identityHeaders, bool) {
 		return h, false
 	}
 	h.TS = ts
-	if _, err := peer.Decode(h.PeerID); err != nil {
+	id, err := peer.Decode(h.PeerID)
+	if err != nil {
 		return h, false
 	}
+	h.ID = id
 	return h, true
 }
 
-func (h identityHeaders) verify(signed string) bool {
-	return freshTS(h.TS) && verifySigned(h.PeerID, h.Pub, h.Sig, signed) && !replays.seenOrAdd(h.Sig)
+func (h identityHeaders) verify(signed string, skew time.Duration) bool {
+	return freshTS(h.TS, skew) && verifySigned(h.PeerID, h.Pub, h.Sig, signed) && !replays.seenOrAdd(h.Sig, skew)
 }
 
 type replayCache struct {
@@ -102,18 +106,18 @@ type replayCache struct {
 
 var replays = &replayCache{seen: make(map[string]time.Time)}
 
-func (c *replayCache) seenOrAdd(sig string) bool {
+func (c *replayCache) seenOrAdd(sig string, skew time.Duration) bool {
 	now := time.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.seen) > 4096 {
 		for k, t := range c.seen {
-			if now.Sub(t) > 2*tsSkew {
+			if now.Sub(t) > 2*skew {
 				delete(c.seen, k)
 			}
 		}
 	}
-	if t, ok := c.seen[sig]; ok && now.Sub(t) <= 2*tsSkew {
+	if t, ok := c.seen[sig]; ok && now.Sub(t) <= 2*skew {
 		return true
 	}
 	c.seen[sig] = now
@@ -144,7 +148,7 @@ func newDeviceKey() (string, error) {
 
 func readDeviceHeaders(r *http.Request) (subID, key string) {
 	subID = strings.TrimSpace(r.Header.Get(headerDeviceID))
-	key = strings.ToLower(strings.TrimSpace(r.Header.Get(headerDeviceKey)))
+	key = normalHex(r.Header.Get(headerDeviceKey))
 	return subID, key
 }
 

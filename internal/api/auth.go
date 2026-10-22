@@ -63,10 +63,11 @@ func originLocal(r *http.Request) bool {
 }
 
 func (s *Server) checkAuth(r *http.Request) bool {
-	if s.cfg.APIToken == "" {
+	token := s.config().APIToken
+	if token == "" {
 		return true
 	}
-	want := []byte(s.cfg.APIToken)
+	want := []byte(token)
 
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		got := []byte(strings.TrimPrefix(h, "Bearer "))
@@ -94,7 +95,7 @@ func (s *Server) operatorOnly(w http.ResponseWriter, r *http.Request, requireJSO
 			return false
 		}
 	}
-	if s.cfg.APIToken != "" {
+	if s.config().APIToken != "" {
 		return true
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)

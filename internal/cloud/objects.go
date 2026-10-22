@@ -11,10 +11,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/config"
+
 	"golang.org/x/crypto/blake2b"
 )
 
@@ -23,6 +23,8 @@ const (
 	TierMedia = "media"
 )
 
+func validTier(tier string) bool { return tier == TierBase || tier == TierMedia }
+
 var (
 	ErrHashMismatch = errors.New("object id does not match ciphertext hash")
 	ErrOffset       = errors.New("upload offset mismatch")
@@ -30,40 +32,24 @@ var (
 )
 
 type objectStore struct {
-	root  string
 	tmp   string
 	local *localBackend
 	media Backend
 	cfg   config.CloudConfig
-
-	mu    sync.Mutex
-	locks map[string]*sync.Mutex
+	locks *keyedMutex[string]
 }
 
 func newObjectStore(root string, media Backend, cfg config.CloudConfig) *objectStore {
 	return &objectStore{
-		root:  root,
 		tmp:   filepath.Join(root, "tmp"),
 		local: newLocalBackend(filepath.Join(root, "objects")),
 		media: media,
 		cfg:   cfg,
-		locks: make(map[string]*sync.Mutex),
+		locks: newKeyedMutex[string](),
 	}
 }
 
 func (o *objectStore) maxBytes() int64 { return int64(o.cfg.ObjectMaxMB) << 20 }
-
-func (o *objectStore) lock(key string) func() {
-	o.mu.Lock()
-	m, ok := o.locks[key]
-	if !ok {
-		m = &sync.Mutex{}
-		o.locks[key] = m
-	}
-	o.mu.Unlock()
-	m.Lock()
-	return m.Unlock
-}
 
 func (o *objectStore) backendFor(tier string) Backend {
 	if tier == TierMedia {
@@ -117,10 +103,7 @@ func (o *objectStore) partPath(vault, id, tier string, total int64) string {
 }
 
 func (o *objectStore) findPart(vault, id string) (path string, tier string, total int64, received int64, ok bool) {
-	entries, err := os.ReadDir(o.tmp)
-	if err != nil {
-		return "", "", 0, 0, false
-	}
+	entries := listDir(o.tmp)
 	prefix := vault + "." + id + "."
 	for _, e := range entries {
 		name := e.Name()
@@ -146,7 +129,7 @@ func (o *objectStore) findPart(vault, id string) (path string, tier string, tota
 }
 
 func (o *objectStore) Received(vault, id string) (int64, bool) {
-	unlock := o.lock(vault + "." + id)
+	unlock := o.locks.lock(vault + "." + id)
 	defer unlock()
 	_, _, _, received, ok := o.findPart(vault, id)
 	return received, ok
@@ -160,13 +143,13 @@ type uploadResult struct {
 }
 
 func (o *objectStore) Append(vault, id, tier string, start, total int64, body io.Reader) (uploadResult, error) {
-	if tier != TierBase && tier != TierMedia {
+	if !validTier(tier) {
 		return uploadResult{}, fmt.Errorf("invalid tier %q", tier)
 	}
 	if total <= 0 || total > o.maxBytes() {
 		return uploadResult{}, ErrTooLarge
 	}
-	unlock := o.lock(vault + "." + id)
+	unlock := o.locks.lock(vault + "." + id)
 	defer unlock()
 
 	path, existingTier, existingTotal, received, ok := o.findPart(vault, id)
@@ -233,19 +216,8 @@ func (o *objectStore) finalize(path, id, tier string) error {
 	return backend.PutFile(id, path)
 }
 
-func (o *objectStore) Abandon(vault, id string) {
-	unlock := o.lock(vault + "." + id)
-	defer unlock()
-	if path, _, _, _, ok := o.findPart(vault, id); ok {
-		_ = os.Remove(path)
-	}
-}
-
 func (o *objectStore) sweepParts(olderThan time.Duration) {
-	entries, err := os.ReadDir(o.tmp)
-	if err != nil {
-		return
-	}
+	entries := listDir(o.tmp)
 	cutoff := time.Now().Add(-olderThan)
 	for _, e := range entries {
 		info, err := e.Info()
@@ -253,12 +225,7 @@ func (o *objectStore) sweepParts(olderThan time.Duration) {
 			continue
 		}
 		if info.ModTime().Before(cutoff) {
-			_ = os.Remove(filepath.Join(o.tmp, e.Name()))
+			removeFile(filepath.Join(o.tmp, e.Name()))
 		}
 	}
-}
-
-func Hash(b []byte) string {
-	sum := blake2b.Sum256(b)
-	return hex.EncodeToString(sum[:])
 }

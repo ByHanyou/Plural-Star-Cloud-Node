@@ -4,7 +4,7 @@ package network
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"time"
 
 	dht "github.com/libp2p/go-libp2p-kad-dht"
@@ -35,16 +35,16 @@ func NewGossipSub(ctx context.Context, h host.Host, kdht *dht.IpfsDHT) (*pubsub.
 	return ps, rd, nil
 }
 
-func AdvertiseAndDiscover(ctx context.Context, h host.Host, rd *drouting.RoutingDiscovery, rendezvous string) {
+func AdvertiseAndDiscover(ctx context.Context, h host.Host, rd *drouting.RoutingDiscovery, rendezvous string, interval, dialTimeout time.Duration) {
 	if rd == nil {
 		return
 	}
 	dutil.Advertise(ctx, rd, rendezvous)
 	go func() {
-		ticker := time.NewTicker(60 * time.Second)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
-			findAndConnect(ctx, h, rd, rendezvous)
+			findAndConnect(ctx, h, rd, rendezvous, dialTimeout)
 			select {
 			case <-ctx.Done():
 				return
@@ -54,10 +54,10 @@ func AdvertiseAndDiscover(ctx context.Context, h host.Host, rd *drouting.Routing
 	}()
 }
 
-func findAndConnect(ctx context.Context, h host.Host, rd *drouting.RoutingDiscovery, rendezvous string) {
+func findAndConnect(ctx context.Context, h host.Host, rd *drouting.RoutingDiscovery, rendezvous string, dialTimeout time.Duration) {
 	peerCh, err := rd.FindPeers(ctx, rendezvous)
 	if err != nil {
-		log.Printf("discovery: find peers: %v", err)
+		slog.Warn("discovery: find peers failed", "err", err)
 		return
 	}
 	for ai := range peerCh {
@@ -67,32 +67,37 @@ func findAndConnect(ctx context.Context, h host.Host, rd *drouting.RoutingDiscov
 		if h.Network().Connectedness(ai.ID) == corenet.Connected {
 			continue
 		}
-		dialCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		if err := h.Connect(dialCtx, ai); err == nil {
-			log.Printf("discovery: connected to %s", ai.ID)
+		dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+		if err := h.Connect(dialCtx, ai); err != nil {
+			slog.Debug("discovery: dial failed", "peer", ai.ID, "err", err)
+		} else {
+			slog.Debug("discovery: connected", "peer", ai.ID)
 		}
 		cancel()
 	}
 }
 
 type mdnsNotifee struct {
-	h   host.Host
-	ctx context.Context
+	dialTimeout time.Duration
+	h           host.Host
+	ctx         context.Context
 }
 
 func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	if pi.ID == n.h.ID() {
 		return
 	}
-	dialCtx, cancel := context.WithTimeout(n.ctx, 15*time.Second)
+	dialCtx, cancel := context.WithTimeout(n.ctx, n.dialTimeout)
 	defer cancel()
-	if err := n.h.Connect(dialCtx, pi); err == nil {
-		log.Printf("mdns: connected to LAN peer %s", pi.ID)
+	if err := n.h.Connect(dialCtx, pi); err != nil {
+		slog.Debug("mdns: dial failed", "peer", pi.ID, "err", err)
+		return
 	}
+	slog.Debug("mdns: connected to LAN peer", "peer", pi.ID)
 }
 
-func SetupMDNS(ctx context.Context, h host.Host) (mdns.Service, error) {
-	svc := mdns.NewMdnsService(h, mdnsServiceTag, &mdnsNotifee{h: h, ctx: ctx})
+func SetupMDNS(ctx context.Context, h host.Host, dialTimeout time.Duration) (mdns.Service, error) {
+	svc := mdns.NewMdnsService(h, mdnsServiceTag, &mdnsNotifee{h: h, ctx: ctx, dialTimeout: dialTimeout})
 	if err := svc.Start(); err != nil {
 		return nil, err
 	}

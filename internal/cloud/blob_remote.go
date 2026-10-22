@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -21,11 +19,11 @@ type remoteBackend struct {
 	client *http.Client
 }
 
-func newRemoteBackend(baseURL, secret string) *remoteBackend {
+func newRemoteBackend(baseURL, secret string, timeout time.Duration) *remoteBackend {
 	return &remoteBackend{
 		base:   strings.TrimRight(baseURL, "/"),
 		secret: secret,
-		client: &http.Client{Timeout: 10 * time.Minute},
+		client: &http.Client{Timeout: timeout},
 	}
 }
 
@@ -56,21 +54,7 @@ func (b *remoteBackend) Put(id string, r io.Reader, size int64) error {
 }
 
 func (b *remoteBackend) PutFile(id string, path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	st, err := f.Stat()
-	if err != nil {
-		_ = f.Close()
-		return err
-	}
-	err = b.Put(id, f, st.Size())
-	_ = f.Close()
-	if err != nil {
-		return err
-	}
-	return os.Remove(path)
+	return putFromPath(id, path, b.Put)
 }
 
 func (b *remoteBackend) Get(id string) (io.ReadCloser, int64, error) {
@@ -78,15 +62,7 @@ func (b *remoteBackend) Get(id string) (io.ReadCloser, int64, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	if resp.StatusCode == http.StatusNotFound {
-		_ = resp.Body.Close()
-		return nil, 0, ErrNotFound
-	}
-	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
-		return nil, 0, fmt.Errorf("remote blob get %s: status %d", id, resp.StatusCode)
-	}
-	return resp.Body, resp.ContentLength, nil
+	return blobGetResult(resp, "remote blob", id)
 }
 
 func (b *remoteBackend) Head(id string) (int64, error) {
@@ -94,15 +70,7 @@ func (b *remoteBackend) Head(id string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		return 0, ErrNotFound
-	}
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("remote blob head %s: status %d", id, resp.StatusCode)
-	}
-	size, _ := strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
-	return size, nil
+	return blobHeadResult(resp, "remote blob", id)
 }
 
 func (b *remoteBackend) Delete(id string) error {
@@ -110,11 +78,7 @@ func (b *remoteBackend) Delete(id string) error {
 	if err != nil {
 		return err
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
-		return fmt.Errorf("remote blob delete %s: status %d", id, resp.StatusCode)
-	}
-	return nil
+	return blobDeleteResult(resp, "remote blob", id)
 }
 
 type blobListEntry struct {

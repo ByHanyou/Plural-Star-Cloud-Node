@@ -10,13 +10,13 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-const (
-	QueueEntryTTL      = 7 * 24 * time.Hour
-	QueueMaxSenders    = 500
-	QueueMaxRecipients = 10000
-	QueueMaxBytes      = 64 << 20
-	QueueSweepInterval = 30 * time.Minute
-)
+type QueueLimits struct {
+	EntryTTL      time.Duration
+	MaxSenders    int
+	MaxRecipients int
+	MaxBytes      int64
+	SweepInterval time.Duration
+}
 
 type queuedPacket struct {
 	pkt  *Packet
@@ -25,13 +25,14 @@ type queuedPacket struct {
 }
 
 type Queue struct {
+	lim   QueueLimits
 	mu    sync.Mutex
 	items map[peer.ID]map[string]queuedPacket
 	bytes int64
 }
 
-func NewQueue(ctx context.Context) *Queue {
-	q := &Queue{items: make(map[peer.ID]map[string]queuedPacket)}
+func NewQueue(ctx context.Context, lim QueueLimits) *Queue {
+	q := &Queue{lim: lim, items: make(map[peer.ID]map[string]queuedPacket)}
 	go q.sweepLoop(ctx)
 	return q
 }
@@ -50,20 +51,20 @@ func (q *Queue) Put(recipient peer.ID, p *Packet) bool {
 	defer q.mu.Unlock()
 	bucket, ok := q.items[recipient]
 	if !ok {
-		if len(q.items) >= QueueMaxRecipients {
+		if len(q.items) >= q.lim.MaxRecipients {
 			return false
 		}
 		bucket = make(map[string]queuedPacket)
 	}
 	old, exists := bucket[sender]
-	if !exists && len(bucket) >= QueueMaxSenders {
+	if !exists && len(bucket) >= q.lim.MaxSenders {
 		return false
 	}
 	var freed int64
 	if exists {
 		freed = old.size
 	}
-	if q.bytes-freed+size > QueueMaxBytes {
+	if q.bytes-freed+size > q.lim.MaxBytes {
 		return false
 	}
 	if !ok {
@@ -83,7 +84,7 @@ func (q *Queue) Take(recipient peer.ID) []*Packet {
 	}
 	delete(q.items, recipient)
 	out := make([]*Packet, 0, len(bucket))
-	cutoff := time.Now().Add(-QueueEntryTTL)
+	cutoff := time.Now().Add(-q.lim.EntryTTL)
 	for _, entry := range bucket {
 		q.bytes -= entry.size
 		if entry.at.Before(cutoff) {
@@ -94,12 +95,6 @@ func (q *Queue) Take(recipient peer.ID) []*Packet {
 	return out
 }
 
-func (q *Queue) Len(recipient peer.ID) int {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return len(q.items[recipient])
-}
-
 func (q *Queue) Bytes() int64 {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -107,7 +102,7 @@ func (q *Queue) Bytes() int64 {
 }
 
 func (q *Queue) sweepLoop(ctx context.Context) {
-	ticker := time.NewTicker(QueueSweepInterval)
+	ticker := time.NewTicker(q.lim.SweepInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -120,7 +115,7 @@ func (q *Queue) sweepLoop(ctx context.Context) {
 }
 
 func (q *Queue) sweep() {
-	cutoff := time.Now().Add(-QueueEntryTTL)
+	cutoff := time.Now().Add(-q.lim.EntryTTL)
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	for recipient, bucket := range q.items {

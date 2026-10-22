@@ -1,9 +1,13 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 package relay
 
 import (
 	"context"
 	"testing"
 	"time"
+
+	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/config"
 
 	"github.com/libp2p/go-libp2p"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
@@ -48,11 +52,11 @@ func TestTwoNodeRelayDelivery(t *testing.T) {
 	}
 
 	const prefix = "plural-star:test:"
-	m1, err := NewManager(ctx, h1, ps1, prefix, nil)
+	m1, err := NewManager(ctx, h1, ps1, prefix, config.DefaultLimits(), nil)
 	if err != nil {
 		t.Fatalf("manager1: %v", err)
 	}
-	m2, err := NewManager(ctx, h2, ps2, prefix, nil)
+	m2, err := NewManager(ctx, h2, ps2, prefix, config.DefaultLimits(), nil)
 	if err != nil {
 		t.Fatalf("manager2: %v", err)
 	}
@@ -72,11 +76,11 @@ func TestTwoNodeRelayDelivery(t *testing.T) {
 		Timestamp:   time.Now().UnixMilli(),
 	}
 
-	if err := m1.Route(pkt); err != nil {
-		t.Fatalf("route 1: %v", err)
+	if out, err := m1.Route(pkt); err != nil || out != OutcomeForwarded {
+		t.Fatalf("route 1: outcome=%q err=%v", out, err)
 	}
-	if err := m1.Route(pkt); err != nil {
-		t.Fatalf("route 2: %v", err)
+	if out, err := m1.Route(pkt); err != nil || out != OutcomeDuplicate {
+		t.Fatalf("route 2: outcome=%q err=%v", out, err)
 	}
 
 	select {
@@ -92,5 +96,38 @@ func TestTwoNodeRelayDelivery(t *testing.T) {
 	case <-delivered:
 		t.Fatal("duplicate packet was delivered twice (dedup failed)")
 	case <-time.After(500 * time.Millisecond):
+	}
+
+	id2, _ := NewPacketID()
+	local := &Packet{
+		ID:          id2,
+		SenderID:    []byte("origin-app"),
+		RecipientID: []byte(appPeer),
+		Payload:     []byte("local"),
+		Timestamp:   time.Now().UnixMilli(),
+	}
+	if out, err := m2.Route(local); err != nil || out != OutcomeDelivered {
+		t.Fatalf("local route: outcome=%q err=%v", out, err)
+	}
+	select {
+	case <-delivered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("local packet was not delivered")
+	}
+
+	stranger := test.RandPeerIDFatal(t)
+	id3, _ := NewPacketID()
+	held := &Packet{
+		ID:          id3,
+		SenderID:    []byte("origin-app"),
+		RecipientID: []byte(stranger),
+		Payload:     []byte("later"),
+		Timestamp:   time.Now().UnixMilli(),
+	}
+	if out, err := m1.Route(held); err != nil || out != OutcomeHeld {
+		t.Fatalf("held route: outcome=%q err=%v", out, err)
+	}
+	if got := m1.queue.Take(stranger); len(got) != 1 {
+		t.Fatalf("held packet count = %d, want 1", len(got))
 	}
 }

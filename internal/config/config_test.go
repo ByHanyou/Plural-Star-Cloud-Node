@@ -75,6 +75,11 @@ func TestValidateNetworkModes(t *testing.T) {
 		if err := c.Validate(); err == nil {
 			t.Fatal("no listen_addrs should fail")
 		}
+		c = base()
+		c.KeypairPath = ""
+		if err := c.Validate(); err == nil {
+			t.Fatal("empty keypair_path should fail")
+		}
 	})
 }
 
@@ -144,5 +149,21 @@ func TestLoadKeepsAPITokenOnPrivateNetwork(t *testing.T) {
 	}
 	if cfg.APIToken != "keep-me" {
 		t.Fatalf("private network token should survive, got %q", cfg.APIToken)
+	}
+}
+
+func TestExampleConfigMatchesDefaults(t *testing.T) {
+	cfg, firstRun, err := Load(filepath.Join("..", "..", "config.yaml.example"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstRun {
+		t.Fatal("example config treated as missing")
+	}
+	if cfg.LogLevel != LogLevelInfo {
+		t.Fatalf("log_level = %q", cfg.LogLevel)
+	}
+	if cfg.Limits != DefaultLimits() {
+		t.Fatalf("limits differ from defaults:\n got %+v\nwant %+v", cfg.Limits, DefaultLimits())
 	}
 }

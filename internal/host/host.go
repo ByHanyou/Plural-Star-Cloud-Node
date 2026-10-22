@@ -5,6 +5,7 @@ package host
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -31,7 +32,7 @@ import (
 func LoadIdentity(path string) (crypto.PrivKey, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("keypair %q does not exist and require_existing_identity is set: refusing to generate a new peer ID (copy node.key into place, or unset the flag for a fresh node)", path)
 		}
 		return nil, fmt.Errorf("read keypair %q: %w", path, err)
@@ -52,7 +53,7 @@ func LoadOrCreateIdentity(path string) (crypto.PrivKey, error) {
 		}
 		return priv, nil
 	}
-	if !os.IsNotExist(err) {
+	if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("read keypair %q: %w", path, err)
 	}
 
@@ -79,7 +80,7 @@ func New(cfg *config.Config, priv crypto.PrivKey, psk []byte, agent string) (hos
 	cm, err := connmgr.NewConnManager(
 		cfg.MaxPeers/2,
 		cfg.MaxPeers,
-		connmgr.WithGracePeriod(time.Minute),
+		connmgr.WithGracePeriod(cfg.Limits.ConnmgrGracePeriod.Std()),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("connection manager: %w", err)
@@ -102,6 +103,8 @@ func New(cfg *config.Config, priv crypto.PrivKey, psk []byte, agent string) (hos
 	}
 	if psk == nil {
 		opts = append(opts, libp2p.Transport(libp2pquic.NewTransport))
+	} else {
+		opts = append(opts, libp2p.PrivateNetwork(psk))
 	}
 	if agent != "" {
 		opts = append(opts, libp2p.UserAgent(agent))
@@ -119,10 +122,6 @@ func New(cfg *config.Config, priv crypto.PrivKey, psk []byte, agent string) (hos
 		opts = append(opts, libp2p.AddrsFactory(func([]ma.Multiaddr) []ma.Multiaddr {
 			return announce
 		}))
-	}
-
-	if psk != nil {
-		opts = append(opts, libp2p.PrivateNetwork(psk))
 	}
 
 	h, err := libp2p.New(opts...)
@@ -146,14 +145,14 @@ func NewDHT(ctx context.Context, h host.Host, prefix string) (*dht.IpfsDHT, erro
 	return kdht, nil
 }
 
-func ConnectPeers(ctx context.Context, h host.Host, infos []peer.AddrInfo) (int, error) {
+func ConnectPeers(ctx context.Context, h host.Host, infos []peer.AddrInfo, concurrency int, timeout time.Duration) (int, error) {
 	var (
 		mu        sync.Mutex
 		wg        sync.WaitGroup
 		connected int
 		firstErr  error
 	)
-	sem := make(chan struct{}, 8)
+	sem := make(chan struct{}, concurrency)
 	for _, ai := range infos {
 		if ai.ID == h.ID() {
 			continue
@@ -166,7 +165,7 @@ func ConnectPeers(ctx context.Context, h host.Host, infos []peer.AddrInfo) (int,
 		go func(ai peer.AddrInfo) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			dialCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 			cErr := h.Connect(dialCtx, ai)
 			mu.Lock()

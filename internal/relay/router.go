@@ -4,83 +4,42 @@ package relay
 
 import (
 	"context"
-	"sync"
 	"time"
+
+	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/ttlmap"
 
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-type RoutingEntry struct {
-	ViaNode   peer.ID
-	ExpiresAt time.Time
-}
-
 type Router struct {
-	mu    sync.RWMutex
-	table map[peer.ID]RoutingEntry
+	table *ttlmap.Map[peer.ID, peer.ID]
 }
 
 func NewRouter(ctx context.Context, pruneInterval time.Duration) *Router {
-	r := &Router{table: make(map[peer.ID]RoutingEntry)}
-	go r.pruneLoop(ctx, pruneInterval)
-	return r
+	return &Router{table: ttlmap.New[peer.ID, peer.ID](ctx, pruneInterval, nil)}
 }
 
 func (r *Router) Upsert(target, via peer.ID, ttl time.Duration) {
-	r.mu.Lock()
-	r.table[target] = RoutingEntry{ViaNode: via, ExpiresAt: time.Now().Add(ttl)}
-	r.mu.Unlock()
+	r.table.Put(target, via, ttl)
 }
 
 func (r *Router) Remove(target peer.ID) {
-	r.mu.Lock()
-	delete(r.table, target)
-	r.mu.Unlock()
+	r.table.Remove(target)
 }
 
 func (r *Router) Lookup(target peer.ID) (peer.ID, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	e, ok := r.table[target]
-	if !ok || time.Now().After(e.ExpiresAt) {
-		return "", false
-	}
-	return e.ViaNode, true
+	return r.table.Get(target)
 }
 
-func (r *Router) Online() []peer.ID {
-	now := time.Now()
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	out := make([]peer.ID, 0, len(r.table))
-	for id, e := range r.table {
-		if now.Before(e.ExpiresAt) {
-			out = append(out, id)
-		}
-	}
+type PeerRoute struct {
+	Peer peer.ID
+	Via  peer.ID
+}
+
+func (r *Router) Snapshot() []PeerRoute {
+	out := make([]PeerRoute, 0, r.table.Len())
+	r.table.Each(func(id, via peer.ID, _ time.Time) {
+		out = append(out, PeerRoute{Peer: id, Via: via})
+	})
 	return out
-}
-
-func (r *Router) pruneLoop(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			r.prune()
-		}
-	}
-}
-
-func (r *Router) prune() {
-	now := time.Now()
-	r.mu.Lock()
-	for id, e := range r.table {
-		if now.After(e.ExpiresAt) {
-			delete(r.table, id)
-		}
-	}
-	r.mu.Unlock()
 }

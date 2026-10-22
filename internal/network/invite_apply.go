@@ -5,19 +5,20 @@ package network
 import (
 	"fmt"
 	"os"
+	"slices"
 
 	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/config"
 )
 
-func ApplyInvite(cfg *config.Config, inv Invite, pskPath string) error {
+func ApplyInvite(cfg config.Config, inv Invite, pskPath string) (config.Config, error) {
 	if pskPath == "" {
-		pskPath = "./network.psk"
+		pskPath = config.DefaultPSKPath
 	}
 	if len(inv.PSK) != pskLen {
-		return fmt.Errorf("invite psk must be %d bytes", pskLen)
+		return cfg, fmt.Errorf("invite psk must be %d bytes", pskLen)
 	}
 	if err := os.WriteFile(pskPath, inv.PSK, 0o600); err != nil {
-		return fmt.Errorf("write psk %q: %w", pskPath, err)
+		return cfg, fmt.Errorf("write psk %q: %w", pskPath, err)
 	}
 
 	cfg.NetworkMode = config.ModePrivate
@@ -25,20 +26,13 @@ func ApplyInvite(cfg *config.Config, inv Invite, pskPath string) error {
 	if inv.Label != "" {
 		cfg.NetworkID = inv.Label
 	}
+	peers := slices.Clone(cfg.BootstrapPeers)
 	for _, a := range inv.Multiaddrs {
 		s := a.String()
-		if !containsString(cfg.BootstrapPeers, s) {
-			cfg.BootstrapPeers = append(cfg.BootstrapPeers, s)
+		if !slices.Contains(peers, s) {
+			peers = append(peers, s)
 		}
 	}
-	return nil
-}
-
-func containsString(list []string, s string) bool {
-	for _, v := range list {
-		if v == s {
-			return true
-		}
-	}
-	return false
+	cfg.BootstrapPeers = peers
+	return cfg, nil
 }

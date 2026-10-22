@@ -9,22 +9,24 @@ import (
 )
 
 const (
-	limitPerAddress = 10
-	windowAddress   = time.Minute
-	limitPerVault   = 20
-	windowVault     = time.Hour
+	windowAddress = time.Minute
+	windowVault   = time.Hour
 )
 
 type rateLimiter struct {
-	mu      sync.Mutex
-	byAddr  map[string][]time.Time
-	byVault map[string][]time.Time
+	perAddress int
+	perVault   int
+	mu         sync.Mutex
+	byAddr     map[string][]time.Time
+	byVault    map[string][]time.Time
 }
 
-func newRateLimiter() *rateLimiter {
+func newRateLimiter(perAddress, perVault int) *rateLimiter {
 	return &rateLimiter{
-		byAddr:  make(map[string][]time.Time),
-		byVault: make(map[string][]time.Time),
+		perAddress: perAddress,
+		perVault:   perVault,
+		byAddr:     make(map[string][]time.Time),
+		byVault:    make(map[string][]time.Time),
 	}
 }
 
@@ -42,13 +44,13 @@ func (l *rateLimiter) check(addr, vault string) (ok bool, retryAfter time.Durati
 	defer l.mu.Unlock()
 	a := prune(l.byAddr[addr], now.Add(-windowAddress))
 	l.byAddr[addr] = a
-	if len(a) >= limitPerAddress {
+	if len(a) >= l.perAddress {
 		return false, a[0].Add(windowAddress).Sub(now)
 	}
 	if vault != "" {
 		v := prune(l.byVault[vault], now.Add(-windowVault))
 		l.byVault[vault] = v
-		if len(v) >= limitPerVault {
+		if len(v) >= l.perVault {
 			return false, v[0].Add(windowVault).Sub(now)
 		}
 	}
@@ -73,25 +75,24 @@ func (l *rateLimiter) sweepLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			now := time.Now()
-			l.mu.Lock()
-			for k, ev := range l.byAddr {
-				ev = prune(ev, now.Add(-windowAddress))
-				if len(ev) == 0 {
-					delete(l.byAddr, k)
-				} else {
-					l.byAddr[k] = ev
-				}
-			}
-			for k, ev := range l.byVault {
-				ev = prune(ev, now.Add(-windowVault))
-				if len(ev) == 0 {
-					delete(l.byVault, k)
-				} else {
-					l.byVault[k] = ev
-				}
-			}
-			l.mu.Unlock()
+			l.sweep(time.Now())
+		}
+	}
+}
+
+func (l *rateLimiter) sweep(now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	sweepEvents(l.byAddr, now.Add(-windowAddress))
+	sweepEvents(l.byVault, now.Add(-windowVault))
+}
+
+func sweepEvents(m map[string][]time.Time, cutoff time.Time) {
+	for k, ev := range m {
+		if ev = prune(ev, cutoff); len(ev) == 0 {
+			delete(m, k)
+		} else {
+			m[k] = ev
 		}
 	}
 }

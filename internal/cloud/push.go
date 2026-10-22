@@ -12,7 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -23,16 +23,13 @@ import (
 	"time"
 
 	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/config"
+
 	"golang.org/x/crypto/nacl/box"
 )
 
 const (
 	pushKindRegister = "register"
 	pushKindEvent    = "event"
-	pushRegisterTTL  = 7 * 24 * time.Hour
-	pushEventTTL     = 12 * time.Hour
-	pushMaxBody      = 16 << 10
-	pushMaxBackoff   = 5 * time.Minute
 )
 
 var ErrPushDisabled = errors.New("push relay not configured")
@@ -45,8 +42,8 @@ type pushItem struct {
 
 type pushRelay struct {
 	ctx      context.Context
-	dir      string
 	cfg      config.CloudConfig
+	lim      config.Limits
 	client   *http.Client
 	pub      *[32]byte
 	priv     *[32]byte
@@ -55,12 +52,12 @@ type pushRelay struct {
 	queueDir string
 }
 
-func newPushRelay(ctx context.Context, dir, keyPath string, cfg config.CloudConfig) (*pushRelay, error) {
+func newPushRelay(ctx context.Context, dir, keyPath string, cfg config.CloudConfig, lim config.Limits) (*pushRelay, error) {
 	p := &pushRelay{
 		ctx:      ctx,
-		dir:      dir,
 		cfg:      cfg,
-		client:   &http.Client{Timeout: 30 * time.Second},
+		lim:      lim,
+		client:   &http.Client{Timeout: lim.PushHTTPTimeout.Std()},
 		wake:     make(chan struct{}, 1),
 		queueDir: filepath.Join(dir, "queue"),
 	}
@@ -93,7 +90,7 @@ func (p *pushRelay) loadOrCreateKey(path string) error {
 		p.pub, p.priv = pub, prv
 		return nil
 	}
-	if !os.IsNotExist(err) {
+	if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("read push key %q: %w", path, err)
 	}
 	pub, prv, kerr := box.GenerateKey(rand.Reader)
@@ -162,10 +159,7 @@ func (p *pushRelay) enqueue(kind string, body []byte) error {
 }
 
 func (p *pushRelay) queueLen() int {
-	entries, err := os.ReadDir(p.queueDir)
-	if err != nil {
-		return 0
-	}
+	entries := listDir(p.queueDir)
 	n := 0
 	for _, e := range entries {
 		if strings.HasSuffix(e.Name(), ".json") {
@@ -189,18 +183,15 @@ func (p *pushRelay) forwardLoop() {
 			backoff = time.Second
 		} else {
 			backoff *= 2
-			if backoff > pushMaxBackoff {
-				backoff = pushMaxBackoff
+			if backoff > p.lim.PushMaxBackoff.Std() {
+				backoff = p.lim.PushMaxBackoff.Std()
 			}
 		}
 	}
 }
 
 func (p *pushRelay) drain() bool {
-	entries, err := os.ReadDir(p.queueDir)
-	if err != nil {
-		return true
-	}
+	entries := listDir(p.queueDir)
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
 		if strings.HasSuffix(e.Name(), ".json") {
@@ -213,19 +204,21 @@ func (p *pushRelay) drain() bool {
 		path := filepath.Join(p.queueDir, name)
 		raw, err := os.ReadFile(path)
 		if err != nil {
+			slog.Warn("push relay: reading queued item failed", "file", name, "err", err)
 			continue
 		}
 		var item pushItem
-		if json.Unmarshal(raw, &item) != nil {
-			_ = os.Remove(path)
+		if err := json.Unmarshal(raw, &item); err != nil {
+			slog.Warn("push relay: dropping unreadable queued item", "file", name, "err", err)
+			removeFile(path)
 			continue
 		}
-		ttl := pushEventTTL
+		ttl := p.lim.PushEventTTL.Std()
 		if item.Kind == pushKindRegister {
-			ttl = pushRegisterTTL
+			ttl = p.lim.PushRegisterTTL.Std()
 		}
 		if time.Since(time.UnixMilli(item.At)) > ttl {
-			_ = os.Remove(path)
+			removeFile(path)
 			continue
 		}
 		reachable, done := p.forward(item)
@@ -233,7 +226,7 @@ func (p *pushRelay) drain() bool {
 			return false
 		}
 		if done {
-			_ = os.Remove(path)
+			removeFile(path)
 			continue
 		}
 		allDone = false
@@ -249,6 +242,7 @@ func (p *pushRelay) forward(item pushItem) (reachable bool, done bool) {
 	url := strings.TrimRight(p.cfg.PushForwardURL, "/") + route
 	req, err := http.NewRequestWithContext(p.ctx, http.MethodPost, url, bytes.NewReader(item.Body))
 	if err != nil {
+		slog.Warn("push relay: building request failed, dropped", "kind", item.Kind, "err", err)
 		return true, true
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -257,17 +251,17 @@ func (p *pushRelay) forward(item pushItem) (reachable bool, done bool) {
 	}
 	resp, err := p.client.Do(req)
 	if err != nil {
-		log.Printf("push relay: gateway unreachable: %v", err)
+		slog.Warn("push relay: gateway unreachable", "err", err)
 		return false, false
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	_ = resp.Body.Close()
 	if resp.StatusCode >= 500 {
-		log.Printf("push relay: gateway returned %d for %s, retrying", resp.StatusCode, item.Kind)
+		slog.Warn("push relay: gateway error, retrying", "status", resp.StatusCode, "kind", item.Kind)
 		return true, false
 	}
 	if resp.StatusCode >= 400 {
-		log.Printf("push relay: gateway rejected %s with %d, dropped", item.Kind, resp.StatusCode)
+		slog.Warn("push relay: gateway rejected item, dropped", "kind", item.Kind, "status", resp.StatusCode)
 	}
 	return true, true
 }

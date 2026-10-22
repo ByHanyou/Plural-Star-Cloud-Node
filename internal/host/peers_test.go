@@ -20,7 +20,7 @@ const (
 
 func seedMemory(t *testing.T, path string, list []rememberedPeer) {
 	t.Helper()
-	pm := &PeerMemory{path: path, peers: map[peer.ID]rememberedPeer{}, dirty: true}
+	pm := &PeerMemory{path: path, peers: map[peer.ID]rememberedPeer{}, dirty: true, maxPeers: 64, maxAddrs: 8, ttl: 30 * 24 * time.Hour}
 	for _, rp := range list {
 		id, err := peer.Decode(rp.ID)
 		if err != nil {
@@ -41,7 +41,7 @@ func TestPeerMemoryRoundTrip(t *testing.T) {
 		{ID: testPeerA, Addrs: []string{"/ip4/10.0.0.5/tcp/4001"}, LastSeen: now},
 	})
 
-	pm := LoadPeerMemory(path)
+	pm := LoadPeerMemory(path, 64, 8, 30*24*time.Hour)
 	self, _ := peer.Decode(testPeerB)
 	targets := pm.DialTargets(self)
 	if len(targets) != 1 {
@@ -63,20 +63,20 @@ func TestPeerMemorySkipsSelfAndExpired(t *testing.T) {
 		{ID: testPeerB, Addrs: []string{"/ip4/10.0.0.6/tcp/4001"}, LastSeen: now},
 	})
 
-	pm := LoadPeerMemory(path)
+	pm := LoadPeerMemory(path, 64, 8, 30*24*time.Hour)
 	self, _ := peer.Decode(testPeerA)
 	targets := pm.DialTargets(self)
 	if len(targets) != 1 || targets[0].ID.String() != testPeerB {
 		t.Fatalf("self should be excluded, got %v", targets)
 	}
 
-	stale := time.Now().Add(-peerMemoryTTL - time.Hour).Unix()
+	stale := time.Now().Add(-30*24*time.Hour - time.Hour).Unix()
 	path2 := filepath.Join(t.TempDir(), "known_peers.json")
 	raw := []byte(`[{"id":"` + testPeerA + `","addrs":["/ip4/10.0.0.5/tcp/4001"],"last_seen":` + strconv.FormatInt(stale, 10) + `}]`)
 	if err := os.WriteFile(path2, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	pm2 := LoadPeerMemory(path2)
+	pm2 := LoadPeerMemory(path2, 64, 8, 30*24*time.Hour)
 	if got := pm2.DialTargets(self); len(got) != 0 {
 		t.Fatalf("expired entry should be dropped, got %v", got)
 	}
@@ -84,14 +84,14 @@ func TestPeerMemorySkipsSelfAndExpired(t *testing.T) {
 
 func TestPeerMemoryToleratesMissingAndCorruptFiles(t *testing.T) {
 	dir := t.TempDir()
-	if pm := LoadPeerMemory(filepath.Join(dir, "absent.json")); len(pm.peers) != 0 {
+	if pm := LoadPeerMemory(filepath.Join(dir, "absent.json"), 64, 8, 30*24*time.Hour); len(pm.peers) != 0 {
 		t.Fatal("missing file should load empty")
 	}
 	bad := filepath.Join(dir, "corrupt.json")
 	if err := os.WriteFile(bad, []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if pm := LoadPeerMemory(bad); len(pm.peers) != 0 {
+	if pm := LoadPeerMemory(bad, 64, 8, 30*24*time.Hour); len(pm.peers) != 0 {
 		t.Fatal("corrupt file should load empty, not error")
 	}
 }
@@ -118,5 +118,25 @@ func TestMergeTargetsDedupesWithBootstrapPriority(t *testing.T) {
 	}
 	if merged[1].ID != idB {
 		t.Fatalf("remembered-only peer missing, got %v", merged[1])
+	}
+}
+
+func TestPeerMemorySaveCapsRememberedPeers(t *testing.T) {
+	now := time.Now().Unix()
+	pm := &PeerMemory{path: filepath.Join(t.TempDir(), "known_peers.json"), peers: map[peer.ID]rememberedPeer{}, dirty: true, maxPeers: 1, maxAddrs: 8, ttl: 30 * 24 * time.Hour}
+	for i, s := range []string{testPeerA, testPeerB} {
+		id, err := peer.Decode(s)
+		if err != nil {
+			t.Fatalf("bad test peer id %q: %v", s, err)
+		}
+		pm.peers[id] = rememberedPeer{ID: s, Addrs: []string{"/ip4/10.0.0.5/tcp/4001"}, LastSeen: now - int64(i)}
+	}
+	pm.Save()
+	if len(pm.peers) != 1 {
+		t.Fatalf("expected 1 remembered peer after save, got %d", len(pm.peers))
+	}
+	targets := pm.DialTargets("")
+	if len(targets) != 1 || targets[0].ID.String() != testPeerA {
+		t.Fatalf("expected only the most recent peer to stay, got %v", targets)
 	}
 }

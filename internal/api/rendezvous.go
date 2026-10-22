@@ -3,25 +3,22 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
-	"log"
-	"net/http"
+	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
-)
 
-const (
-	rendezvousMaxEntries   = 20000
-	rendezvousMaxRecordLen = 8 * 1024
-	rendezvousMaxTTLSecs   = 3600
+	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/config"
+	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/ttlmap"
 )
 
 type rendezvousEntry struct {
-	record    string
-	expiresAt time.Time
-	local     bool
+	record string
+	local  bool
 }
 
 type persistedEntry struct {
@@ -30,12 +27,19 @@ type persistedEntry struct {
 	Local     bool   `json:"local,omitempty"`
 }
 
-type rendezvousStore struct {
-	mu      sync.Mutex
-	entries map[string]rendezvousEntry
-	path    string
-	fileMu  sync.Mutex
+type rendezvousLocalEntry struct {
+	Namespace string
+	Record    string
+	ExpiresAt time.Time
+}
 
+type RendezvousStore struct {
+	maxEntries int
+	entries    *ttlmap.Map[string, rendezvousEntry]
+	path       string
+	fileMu     sync.Mutex
+
+	timerMu      sync.Mutex
 	persistTimer *time.Timer
 }
 
@@ -48,44 +52,52 @@ func rendezvousPathFor(configPath string) string {
 	return filepath.Join(filepath.Dir(configPath), "rendezvous.json")
 }
 
-func newRendezvousStore(path string) *rendezvousStore {
-	rs := &rendezvousStore{entries: make(map[string]rendezvousEntry), path: path}
+func NewRendezvousStore(ctx context.Context, configPath string, lim config.Limits) *RendezvousStore {
+	return newRendezvousStore(ctx, rendezvousPathFor(configPath), lim.RendezvousMaxEntries)
+}
+
+func newRendezvousStore(ctx context.Context, path string, maxEntries int) *RendezvousStore {
+	rs := &RendezvousStore{path: path, maxEntries: maxEntries}
+	rs.entries = ttlmap.New[string, rendezvousEntry](ctx, time.Minute, func(string, rendezvousEntry) {
+		rs.schedulePersist()
+	})
 	rs.load()
-	go rs.janitor()
 	return rs
 }
 
-func (rs *rendezvousStore) load() {
+func (rs *RendezvousStore) load() {
 	if rs.path == "" {
 		return
 	}
 	b, err := os.ReadFile(rs.path)
 	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("rendezvous: reading saved records failed", "path", rs.path, "err", err)
+		}
 		return
 	}
 	var m map[string]persistedEntry
-	if json.Unmarshal(b, &m) != nil {
+	if err := json.Unmarshal(b, &m); err != nil {
+		slog.Warn("rendezvous: saved records unreadable", "path", rs.path, "err", err)
 		return
 	}
 	now := time.Now()
-	rs.mu.Lock()
 	for ns, e := range m {
 		exp := time.Unix(e.ExpiresAt, 0)
 		if e.Record != "" && exp.After(now) {
-			rs.entries[ns] = rendezvousEntry{record: e.Record, expiresAt: exp, local: e.Local}
+			rs.entries.Put(ns, rendezvousEntry{record: e.Record, local: e.Local}, exp.Sub(now))
 		}
 	}
-	rs.mu.Unlock()
 }
 
-func (rs *rendezvousStore) snapshotLocked() []byte {
+func (rs *RendezvousStore) snapshot() []byte {
 	if rs.path == "" {
 		return nil
 	}
-	m := make(map[string]persistedEntry, len(rs.entries))
-	for ns, e := range rs.entries {
-		m[ns] = persistedEntry{Record: e.record, ExpiresAt: e.expiresAt.Unix(), Local: e.local}
-	}
+	m := make(map[string]persistedEntry)
+	rs.entries.Each(func(ns string, e rendezvousEntry, exp time.Time) {
+		m[ns] = persistedEntry{Record: e.record, ExpiresAt: exp.Unix(), Local: e.local}
+	})
 	b, err := json.Marshal(m)
 	if err != nil {
 		return nil
@@ -93,176 +105,80 @@ func (rs *rendezvousStore) snapshotLocked() []byte {
 	return b
 }
 
-func (rs *rendezvousStore) persist(b []byte) {
+func (rs *RendezvousStore) persist(b []byte) {
 	if rs.path == "" || b == nil {
 		return
 	}
 	rs.fileMu.Lock()
 	defer rs.fileMu.Unlock()
 	tmp := rs.path + ".tmp"
-	if os.WriteFile(tmp, b, 0o600) != nil {
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		slog.Warn("rendezvous: persist failed", "path", rs.path, "err", err)
 		return
 	}
-	_ = os.Rename(tmp, rs.path)
+	if err := os.Rename(tmp, rs.path); err != nil {
+		slog.Warn("rendezvous: persist failed", "path", rs.path, "err", err)
+	}
 }
 
-func (rs *rendezvousStore) schedulePersistLocked() {
+func (rs *RendezvousStore) schedulePersist() {
 	if rs.path == "" {
 		return
 	}
+	rs.timerMu.Lock()
+	defer rs.timerMu.Unlock()
 	if rs.persistTimer != nil {
 		rs.persistTimer.Reset(rendezvousPersistDelay)
 		return
 	}
 	rs.persistTimer = time.AfterFunc(rendezvousPersistDelay, func() {
-		rs.mu.Lock()
-		snapshot := rs.snapshotLocked()
-		rs.mu.Unlock()
-		rs.persist(snapshot)
+		rs.persist(rs.snapshot())
 	})
 }
 
-func (rs *rendezvousStore) janitor() {
-	t := time.NewTicker(time.Minute)
-	defer t.Stop()
-	for range t.C {
-		now := time.Now()
-		rs.mu.Lock()
-		removed := 0
-		for k, e := range rs.entries {
-			if now.After(e.expiresAt) {
-				delete(rs.entries, k)
-				removed++
-			}
+func (rs *RendezvousStore) put(namespace, record string, ttl time.Duration) bool {
+	written := rs.entries.Update(namespace, func(_ rendezvousEntry, exists bool, _ time.Time, size int) (rendezvousEntry, time.Duration, bool) {
+		if !exists && size >= rs.maxEntries {
+			return rendezvousEntry{}, 0, false
 		}
-		if removed > 0 {
-			rs.schedulePersistLocked()
-		}
-		rs.mu.Unlock()
+		return rendezvousEntry{record: record, local: true}, ttl, true
+	})
+	if written {
+		rs.schedulePersist()
 	}
+	return written
 }
 
-func (rs *rendezvousStore) put(namespace, record string, ttl time.Duration) bool {
-	rs.mu.Lock()
-	if _, exists := rs.entries[namespace]; !exists && len(rs.entries) >= rendezvousMaxEntries {
-		rs.mu.Unlock()
-		return false
-	}
-	rs.entries[namespace] = rendezvousEntry{record: record, expiresAt: time.Now().Add(ttl), local: true}
-	rs.schedulePersistLocked()
-	rs.mu.Unlock()
-	return true
-}
-
-func (rs *rendezvousStore) putRemote(namespace, record string, ttl time.Duration) {
+func (rs *RendezvousStore) PutRemote(namespace, record string, ttl time.Duration) {
 	expiresAt := time.Now().Add(ttl)
-	rs.mu.Lock()
-	cur, exists := rs.entries[namespace]
-	if exists && (cur.local || !cur.expiresAt.Before(expiresAt)) {
-		rs.mu.Unlock()
-		return
+	written := rs.entries.Update(namespace, func(cur rendezvousEntry, exists bool, curExpiresAt time.Time, size int) (rendezvousEntry, time.Duration, bool) {
+		if exists && (cur.local || !curExpiresAt.Before(expiresAt)) {
+			return cur, 0, false
+		}
+		if !exists && size >= rs.maxEntries {
+			return cur, 0, false
+		}
+		return rendezvousEntry{record: record, local: false}, ttl, true
+	})
+	if written {
+		rs.schedulePersist()
 	}
-	if !exists && len(rs.entries) >= rendezvousMaxEntries {
-		rs.mu.Unlock()
-		return
-	}
-	rs.entries[namespace] = rendezvousEntry{record: record, expiresAt: expiresAt, local: false}
-	rs.schedulePersistLocked()
-	rs.mu.Unlock()
 }
 
-func (rs *rendezvousStore) localEntries() []struct {
-	Namespace string
-	Record    string
-	ExpiresAt time.Time
-} {
-	now := time.Now()
-	rs.mu.Lock()
-	defer rs.mu.Unlock()
-	var out []struct {
-		Namespace string
-		Record    string
-		ExpiresAt time.Time
-	}
-	for ns, e := range rs.entries {
-		if e.local && e.expiresAt.After(now) {
-			out = append(out, struct {
-				Namespace string
-				Record    string
-				ExpiresAt time.Time
-			}{ns, e.record, e.expiresAt})
+func (rs *RendezvousStore) localEntries() []rendezvousLocalEntry {
+	var out []rendezvousLocalEntry
+	rs.entries.Each(func(ns string, e rendezvousEntry, exp time.Time) {
+		if e.local {
+			out = append(out, rendezvousLocalEntry{Namespace: ns, Record: e.record, ExpiresAt: exp})
 		}
-	}
+	})
 	return out
 }
 
-func (rs *rendezvousStore) get(namespace string) (string, bool) {
-	rs.mu.Lock()
-	defer rs.mu.Unlock()
-	e, ok := rs.entries[namespace]
+func (rs *RendezvousStore) get(namespace string) (string, bool) {
+	e, ok := rs.entries.Get(namespace)
 	if !ok {
-		return "", false
-	}
-	if time.Now().After(e.expiresAt) {
-		delete(rs.entries, namespace)
 		return "", false
 	}
 	return e.record, true
-}
-
-func (s *Server) handleRendezvousRegister(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	var req struct {
-		Namespace string `json:"namespace"`
-		Record    string `json:"record"`
-		TTLSecs   int    `json:"ttl_seconds"`
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON")
-		return
-	}
-	if req.Namespace == "" || req.Record == "" {
-		writeError(w, http.StatusBadRequest, "namespace and record required")
-		return
-	}
-	if len(req.Record) > rendezvousMaxRecordLen {
-		writeError(w, http.StatusBadRequest, "record too large")
-		return
-	}
-	ttl := req.TTLSecs
-	if ttl <= 0 || ttl > rendezvousMaxTTLSecs {
-		ttl = rendezvousMaxTTLSecs
-	}
-	if !s.rv.put(req.Namespace, req.Record, time.Duration(ttl)*time.Second) {
-		writeError(w, http.StatusServiceUnavailable, "rendezvous full")
-		return
-	}
-	if g := s.rendezvousGossip(); g != nil {
-		if err := g.Announce(req.Namespace, req.Record, time.Now().Add(time.Duration(ttl)*time.Second)); err != nil {
-			log.Printf("rendezvous: gossip announce failed: %v", err)
-		}
-	}
-	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-func (s *Server) handleRendezvousLookup(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	ns := r.URL.Query().Get("namespace")
-	if ns == "" {
-		writeError(w, http.StatusBadRequest, "namespace required")
-		return
-	}
-	rec, ok := s.rv.get(ns)
-	if !ok {
-		writeError(w, http.StatusNotFound, "not found")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"record": rec})
 }

@@ -4,11 +4,16 @@
 
 package cloud
 
-import "golang.org/x/sys/unix"
+import (
+	"log/slog"
+
+	"golang.org/x/sys/unix"
+)
 
 func diskUsage(path string) (used, free, total uint64) {
 	var st unix.Statfs_t
 	if err := unix.Statfs(path, &st); err != nil {
+		slog.Warn("cloud: reading disk usage failed", "path", path, "err", err)
 		return 0, 0, 0
 	}
 	bsize := uint64(st.Bsize)

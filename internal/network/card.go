@@ -69,7 +69,7 @@ func VerifyNetworkCard(c *NetworkCard) error {
 		return fmt.Errorf("invalid created_by: %w", err)
 	}
 	pub, err := pid.ExtractPublicKey()
-	if err != nil || pub == nil {
+	if err != nil {
 		return fmt.Errorf("cannot extract public key from created_by peer id: %w", err)
 	}
 	sig, err := base64.StdEncoding.DecodeString(c.Signature)

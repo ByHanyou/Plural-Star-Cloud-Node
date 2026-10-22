@@ -6,81 +6,61 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/gossip"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
-const DefaultDirectoryURL = ""
-
 type NetworkDiscovery struct {
-	ctx   context.Context
-	self  peer.ID
 	store *Store
-	topic *pubsub.Topic
-	sub   *pubsub.Subscription
+	topic *gossip.Topic[NetworkCard]
 }
 
 func NewNetworkDiscovery(ctx context.Context, ps *pubsub.PubSub, self peer.ID, store *Store) (*NetworkDiscovery, error) {
-	topic, err := ps.Join(DiscoveryTopic)
+	nd := &NetworkDiscovery{store: store}
+	topic, err := gossip.Join(ctx, ps, self, DiscoveryTopic, nd.receive)
 	if err != nil {
-		return nil, fmt.Errorf("join discovery topic: %w", err)
+		return nil, err
 	}
-	sub, err := topic.Subscribe()
-	if err != nil {
-		return nil, fmt.Errorf("subscribe discovery topic: %w", err)
-	}
-	nd := &NetworkDiscovery{ctx: ctx, self: self, store: store, topic: topic, sub: sub}
-	go nd.readLoop()
+	nd.topic = topic
 	return nd, nil
 }
 
 func (nd *NetworkDiscovery) publish(card NetworkCard) error {
-	b, err := json.Marshal(card)
+	return nd.topic.Publish(card)
+}
+
+func (nd *NetworkDiscovery) receive(_ peer.ID, card NetworkCard) {
+	if err := VerifyNetworkCard(&card); err != nil {
+		slog.Debug("network: ignoring invalid card", "id", card.ID, "err", err)
+		return
+	}
+	existing, found, err := nd.store.Get(card.ID)
 	if err != nil {
-		return err
+		slog.Warn("network: card lookup failed", "id", card.ID, "err", err)
+		return
 	}
-	return nd.topic.Publish(nd.ctx, b)
-}
-
-func (nd *NetworkDiscovery) readLoop() {
-	for {
-		msg, err := nd.sub.Next(nd.ctx)
-		if err != nil {
-			return
-		}
-		if msg.ReceivedFrom == nd.self {
-			continue
-		}
-		var card NetworkCard
-		if err := json.Unmarshal(msg.Data, &card); err != nil {
-			continue
-		}
-		if err := VerifyNetworkCard(&card); err != nil {
-			continue
-		}
-
-		existing, found, err := nd.store.Get(card.ID)
-		if err != nil {
-			continue
-		}
-		if found && card.CreatedAt <= existing.CreatedAt {
-			continue
-		}
-		if found && card.CreatedBy != existing.CreatedBy {
-			continue
-		}
-		if err := nd.store.Put(card); err != nil {
-			continue
-		}
-		_ = nd.publish(card)
+	if found && card.CreatedAt <= existing.CreatedAt {
+		return
+	}
+	if found && card.CreatedBy != existing.CreatedBy {
+		return
+	}
+	if err := nd.store.Put(card); err != nil {
+		slog.Warn("network: storing card failed", "id", card.ID, "err", err)
+		return
+	}
+	if err := nd.publish(card); err != nil {
+		slog.Debug("network: republishing card failed", "id", card.ID, "err", err)
 	}
 }
 
-func FetchDirectory(ctx context.Context, url string, store *Store) (int, error) {
+func FetchDirectory(ctx context.Context, url string, store *Store, timeout time.Duration) (int, error) {
 	if url == "" {
 		return 0, nil
 	}
@@ -88,7 +68,7 @@ func FetchDirectory(ctx context.Context, url string, store *Store) (int, error) 
 	if err != nil {
 		return 0, err
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, err
@@ -105,12 +85,14 @@ func FetchDirectory(ctx context.Context, url string, store *Store) (int, error) 
 	stored := 0
 	for _, card := range cards {
 		if err := VerifyNetworkCard(&card); err != nil {
-			log.Printf("directory: skipping invalid card %q: %v", card.ID, err)
+			slog.Warn("directory: skipping invalid card", "id", card.ID, "err", err)
 			continue
 		}
-		if err := store.Put(card); err == nil {
-			stored++
+		if err := store.Put(card); err != nil {
+			slog.Warn("directory: storing card failed", "id", card.ID, "err", err)
+			continue
 		}
+		stored++
 	}
 	return stored, nil
 }

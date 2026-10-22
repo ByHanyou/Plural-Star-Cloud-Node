@@ -6,9 +6,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
+	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,34 +21,45 @@ import (
 	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/network"
 	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/ping"
 	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/relay"
+	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/version"
 
 	dht "github.com/libp2p/go-libp2p-kad-dht"
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
-	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 )
-
-type node struct {
-	cfg      *config.Config
-	h        host.Host
-	dht      *dht.IpfsDHT
-	ps       *pubsub.PubSub
-	rd       *drouting.RoutingDiscovery
-	relay    *relay.Manager
-	ping     *ping.Manager
-	api      *api.Server
-	cloud    *cloud.Service
-	networks *network.Store
-}
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config.yaml")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
-	if err := run(*configPath); err != nil {
-		log.Fatalf("fatal: %v", err)
+	if *showVersion {
+		fmt.Printf("%s %s\n", version.AgentName, version.Version)
+		return
 	}
+	if err := run(*configPath); err != nil {
+		slog.Error("fatal", "err", err)
+		os.Exit(1)
+	}
+}
+
+func logLevel(name string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case config.LogLevelDebug:
+		return slog.LevelDebug
+	case config.LogLevelWarn:
+		return slog.LevelWarn
+	case config.LogLevelError:
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
+func setupLogging(level string) {
+	lvl := logLevel(level)
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})))
+	slog.SetLogLoggerLevel(lvl)
 }
 
 func run(configPath string) error {
@@ -54,9 +67,12 @@ func run(configPath string) error {
 	if err != nil {
 		return err
 	}
+	setupLogging(cfg.LogLevel)
+	slog.Info("starting", "version", version.Version, "config", configPath, "log_level", cfg.LogLevel)
 	if firstRun {
 		printFirstRun(configPath, cfg.APIToken)
 	}
+	lim := cfg.Limits
 
 	var priv crypto.PrivKey
 	if cfg.RequireExistingIdentity {
@@ -79,131 +95,133 @@ func run(configPath string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	n := &node{cfg: cfg}
+	var cloudSvc *cloud.Service
 	pushPub := ""
 	if cfg.Cloud.Enabled {
-		svc, cErr := cloud.New(ctx, cfg.Cloud, filepath.Dir(configPath))
+		svc, cErr := cloud.New(ctx, cfg.Cloud, lim, filepath.Dir(configPath))
 		if cErr != nil {
 			return fmt.Errorf("cloud services: %w", cErr)
 		}
-		n.cloud = svc
+		cloudSvc = svc
 		pushPub = svc.PushBoxPublicKey()
 	}
-	agent := cloud.AgentString(cfg.Roles(), pushPub)
+	agent := version.AgentString(cfg.Roles(), pushPub)
 
 	h, err := psnhost.New(cfg, priv, psk, agent)
 	if err != nil {
 		return err
 	}
 	defer h.Close()
-	n.h = h
 
-	log.Printf("node peer ID: %s", h.ID())
-	log.Printf("network mode: %s (scope %q)", cfg.NetworkMode, network.Scope(cfg))
-	log.Printf("agent: %s", agent)
+	slog.Info("node identity", "peer_id", h.ID())
+	slog.Info("network mode", "mode", cfg.NetworkMode, "scope", network.Scope(cfg))
+	slog.Info("agent", "agent", agent)
 	for _, a := range h.Addrs() {
-		log.Printf("listening on: %s/p2p/%s", a, h.ID())
+		slog.Info("listening", "addr", fmt.Sprintf("%s/p2p/%s", a, h.ID()))
 	}
 
+	var kdht *dht.IpfsDHT
 	if cfg.NetworkMode != config.ModePrivate {
-		kdht, dErr := psnhost.NewDHT(ctx, h, network.DHTPrefix(cfg))
+		d, dErr := psnhost.NewDHT(ctx, h, network.DHTPrefix(cfg))
 		if dErr != nil {
 			return dErr
 		}
-		defer kdht.Close()
-		n.dht = kdht
-		log.Printf("DHT started (prefix %s)", network.DHTPrefix(cfg))
+		defer d.Close()
+		kdht = d
+		slog.Info("DHT started", "prefix", network.DHTPrefix(cfg))
 	}
 
-	ps, rd, gErr := network.NewGossipSub(ctx, h, n.dht)
+	ps, rd, gErr := network.NewGossipSub(ctx, h, kdht)
 	if gErr != nil {
 		return fmt.Errorf("gossipsub: %w", gErr)
 	}
-	n.ps, n.rd = ps, rd
-	log.Printf("gossipsub ready")
+	slog.Info("gossipsub ready")
 
-	if n.rd != nil {
-		network.AdvertiseAndDiscover(ctx, h, n.rd, network.DHTPrefix(cfg))
-		log.Printf("DHT peer discovery advertising %q", network.DHTPrefix(cfg))
+	if rd != nil {
+		network.AdvertiseAndDiscover(ctx, h, rd, network.DHTPrefix(cfg), lim.DiscoveryInterval.Std(), lim.DiscoveryDialTimeout.Std())
+		slog.Info("DHT peer discovery advertising", "prefix", network.DHTPrefix(cfg))
 	}
 
-	mdnsSvc, mErr := network.SetupMDNS(ctx, h)
+	mdnsSvc, mErr := network.SetupMDNS(ctx, h, lim.DialTimeout.Std())
 	if mErr != nil {
-		log.Printf("warning: mDNS unavailable: %v", mErr)
+		slog.Warn("mDNS unavailable", "err", mErr)
 	} else {
 		defer mdnsSvc.Close()
-		log.Printf("mDNS LAN discovery started")
+		slog.Info("mDNS LAN discovery started")
 	}
 
-	srv := api.NewServer(cfg, configPath, h, network.Scope(cfg))
-	n.api = srv
+	hub := api.NewHub()
+	rv := api.NewRendezvousStore(ctx, configPath, lim)
 
-	pingMgr := ping.NewManager(ctx, h, srv.OnNodeEvent)
-	n.ping = pingMgr
-	srv.SetPing(pingMgr)
+	pingMgr := ping.NewManager(ctx, h, lim.PingTimeout.Std(), hub.OnNodeEvent)
 
-	mgr, rErr := relay.NewManager(ctx, h, n.ps, network.GossipPrefix(cfg), srv.OnAppPeerEvent)
+	mgr, rErr := relay.NewManager(ctx, h, ps, network.GossipPrefix(cfg), lim, hub.OnAppPeerEvent)
 	if rErr != nil {
 		return fmt.Errorf("relay manager: %w", rErr)
 	}
-	n.relay = mgr
-	srv.SetRelay(mgr)
-	log.Printf("relay protocol %s registered", relay.RelayProtocol)
+	slog.Info("relay protocol registered", "protocol", relay.RelayProtocol)
 
-	rvGossip, rvErr := relay.NewRendezvousGossip(ctx, n.ps, h.ID(), network.GossipPrefix(cfg)+"rendezvous", srv.OnRemoteRendezvous)
+	rvTopic := network.GossipPrefix(cfg) + "rendezvous"
+	rvGossip, rvErr := relay.NewRendezvousGossip(ctx, ps, h.ID(), rvTopic, lim.RendezvousMaxNamespaceLen, lim.RendezvousMaxRecordBytes, lim.RendezvousMaxTTL.Std(), rv.PutRemote)
 	if rvErr != nil {
 		return fmt.Errorf("rendezvous gossip: %w", rvErr)
 	}
-	srv.SetRendezvousGossip(rvGossip)
-	go srv.RendezvousReannounceLoop(ctx)
-	log.Printf("rendezvous gossip joined %q", network.GossipPrefix(cfg)+"rendezvous")
+	slog.Info("rendezvous gossip joined", "topic", rvTopic)
 
-	if n.cloud != nil {
-		srv.SetCloud(n.cloud)
-		mgr.SetOffline(n.cloud.Inbox().Store)
-		mgr.SetOfflineReplay(n.cloud.Inbox().Replay)
-		log.Printf("cloud services attached, roles %v", cfg.Roles())
+	if cloudSvc != nil {
+		mgr.SetOffline(cloudSvc.Inbox().Store)
+		mgr.SetOfflineReplay(cloudSvc.Inbox().Replay)
+		slog.Info("cloud services attached", "roles", cfg.Roles())
 	}
 
+	var networks *network.Store
 	if cfg.NetworkMode != config.ModePrivate {
 		store, sErr := network.OpenStore(network.NetworkDBDefault)
 		if sErr != nil {
 			return fmt.Errorf("network store: %w", sErr)
 		}
 		defer store.Close()
-		n.networks = store
-		srv.SetNetworks(store)
+		networks = store
 
-		if _, ndErr := network.NewNetworkDiscovery(ctx, n.ps, h.ID(), store); ndErr != nil {
+		if _, ndErr := network.NewNetworkDiscovery(ctx, ps, h.ID(), store); ndErr != nil {
 			return fmt.Errorf("network discovery: %w", ndErr)
 		}
-		log.Printf("network discovery joined %q", network.DiscoveryTopic)
+		slog.Info("network discovery joined", "topic", network.DiscoveryTopic)
 
-		directoryURL := cfg.DirectoryURL
-		if directoryURL == "" {
-			directoryURL = network.DefaultDirectoryURL
-		}
 		go func() {
-			if count, fErr := network.FetchDirectory(ctx, directoryURL, store); fErr != nil {
-				log.Printf("directory fetch skipped: %v", fErr)
+			if count, fErr := network.FetchDirectory(ctx, cfg.DirectoryURL, store, lim.DirectoryFetchTimeout.Std()); fErr != nil {
+				slog.Warn("directory fetch failed", "url", cfg.DirectoryURL, "err", fErr)
 			} else if count > 0 {
-				log.Printf("directory: cached %d network card(s)", count)
+				slog.Info("directory cached", "cards", count)
 			}
 		}()
 	}
 
-	go func() {
-		if err := srv.Start(); err != nil {
-			log.Fatalf("API server error: %v", err)
+	srv, aErr := api.New(cfg, configPath, h, api.Deps{
+		Hub:        hub,
+		Rendezvous: rv,
+		Ping:       pingMgr,
+		Relay:      mgr,
+		Networks:   networks,
+		Cloud:      cloudSvc,
+		Gossip:     rvGossip,
+	})
+	if aErr != nil {
+		return aErr
+	}
+	go srv.RendezvousReannounceLoop(ctx)
+
+	srvErr := make(chan error, 1)
+	go func() { srvErr <- srv.Start() }()
+	defer func() {
+		shutCtx, cancel := context.WithTimeout(context.Background(), lim.ShutdownTimeout.Std())
+		defer cancel()
+		if err := srv.Shutdown(shutCtx); err != nil {
+			slog.Warn("API server shutdown", "err", err)
 		}
 	}()
-	defer func() {
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = srv.Shutdown(shutCtx)
-	}()
 
-	peerMem := psnhost.LoadPeerMemory(filepath.Join(filepath.Dir(configPath), "known_peers.json"))
+	peerMem := psnhost.LoadPeerMemory(filepath.Join(filepath.Dir(configPath), "known_peers.json"), lim.PeerMemoryMaxPeers, lim.PeerMemoryMaxAddrs, lim.PeerMemoryTTL.Std())
 
 	bootstrapPeers := network.BootstrapPeers(cfg)
 	bootstrapInfos, bpErr := psnhost.ParsePeerAddrs(bootstrapPeers)
@@ -213,31 +231,35 @@ func run(configPath string) error {
 	remembered := peerMem.DialTargets(h.ID())
 	targets := psnhost.MergeTargets(bootstrapInfos, remembered)
 	if len(targets) > 0 {
-		connected, bErr := psnhost.ConnectPeers(ctx, h, targets)
-		log.Printf("initial bootstrap: connected to %d/%d peers (%d remembered)", connected, len(targets), len(remembered))
+		connected, bErr := psnhost.ConnectPeers(ctx, h, targets, lim.DialConcurrency, lim.DialTimeout.Std())
+		slog.Info("initial bootstrap", "connected", connected, "targets", len(targets), "remembered", len(remembered))
 		if bErr != nil {
-			log.Printf("initial bootstrap partial: %v", bErr)
+			slog.Warn("initial bootstrap partial", "err", bErr)
 		}
 		peerMem.Snapshot(h)
 		peerMem.Save()
 	} else if cfg.NetworkMode == config.ModePublic {
-		log.Printf("warning: no bootstrap peers and no remembered peers")
+		slog.Warn("no bootstrap peers and no remembered peers")
 	}
 
-	go persistentReconnectLoop(ctx, h, bootstrapInfos, peerMem)
+	go persistentReconnectLoop(ctx, h, bootstrapInfos, peerMem, lim)
 
-	go monitorConnections(ctx, h)
+	go monitorConnections(ctx, h, lim.ConnectionMonitorInterval.Std())
 
-	log.Printf("node running; press Ctrl-C to stop")
-	<-ctx.Done()
-	log.Printf("shutting down")
+	slog.Info("node running; press Ctrl-C to stop")
+	select {
+	case <-ctx.Done():
+	case err := <-srvErr:
+		return fmt.Errorf("API server: %w", err)
+	}
+	slog.Info("shutting down")
 	peerMem.Snapshot(h)
 	peerMem.Save()
 	return nil
 }
 
-func persistentReconnectLoop(ctx context.Context, h host.Host, bootstrapInfos []peer.AddrInfo, peerMem *psnhost.PeerMemory) {
-	ticker := time.NewTicker(90 * time.Second)
+func persistentReconnectLoop(ctx context.Context, h host.Host, bootstrapInfos []peer.AddrInfo, peerMem *psnhost.PeerMemory, lim config.Limits) {
+	ticker := time.NewTicker(lim.ReconnectInterval.Std())
 	defer ticker.Stop()
 	for {
 		select {
@@ -250,18 +272,18 @@ func persistentReconnectLoop(ctx context.Context, h host.Host, bootstrapInfos []
 			if len(targets) == 0 {
 				continue
 			}
-			connected, err := psnhost.ConnectPeers(ctx, h, targets)
+			connected, err := psnhost.ConnectPeers(ctx, h, targets, lim.DialConcurrency, lim.DialTimeout.Std())
 			if connected > 0 {
-				log.Printf("reconnect success: %d peers", connected)
+				slog.Debug("reconnect", "connected", connected)
 			} else if err != nil {
-				log.Printf("reconnect failed: %v", err)
+				slog.Warn("reconnect failed", "err", err)
 			}
 		}
 	}
 }
 
-func monitorConnections(ctx context.Context, h host.Host) {
-	ticker := time.NewTicker(5 * time.Minute)
+func monitorConnections(ctx context.Context, h host.Host, interval time.Duration) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -269,14 +291,14 @@ func monitorConnections(ctx context.Context, h host.Host) {
 			return
 		case <-ticker.C:
 			conns := h.Network().Conns()
-			log.Printf("active libp2p connections: %d", len(conns))
+			slog.Debug("active libp2p connections", "count", len(conns))
 		}
 	}
 }
 
 func printFirstRun(configPath, token string) {
 	fmt.Println("=====================================================")
-	fmt.Println(" Plural Star Node - first run")
+	fmt.Println(" Plural Star Cloud Node - first run")
 	fmt.Printf(" Wrote default config to: %s\n", configPath)
 	if token == "" {
 		fmt.Println(" API auth is open, which is correct for a public node: apps on the")

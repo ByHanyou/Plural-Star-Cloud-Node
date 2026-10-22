@@ -4,10 +4,11 @@ package ping
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"time"
 
-	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/cloud"
+	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/version"
 
 	"github.com/libp2p/go-libp2p/core/host"
 	corenet "github.com/libp2p/go-libp2p/core/network"
@@ -26,6 +27,7 @@ type NodeInfo struct {
 type EventFunc func(peerID peer.ID, rttMs int64, connected bool)
 
 type Manager struct {
+	timeout time.Duration
 	ctx     context.Context
 	h       host.Host
 	svc     *pingsvc.PingService
@@ -35,9 +37,10 @@ type Manager struct {
 	rtts map[peer.ID]time.Duration
 }
 
-func NewManager(ctx context.Context, h host.Host, onEvent EventFunc) *Manager {
+func NewManager(ctx context.Context, h host.Host, timeout time.Duration, onEvent EventFunc) *Manager {
 	m := &Manager{
 		ctx:     ctx,
+		timeout: timeout,
 		h:       h,
 		svc:     pingsvc.NewPingService(h),
 		onEvent: onEvent,
@@ -64,11 +67,12 @@ func NewManager(ctx context.Context, h host.Host, onEvent EventFunc) *Manager {
 }
 
 func (m *Manager) measure(p peer.ID) {
-	ctx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(m.ctx, m.timeout)
 	defer cancel()
 	select {
 	case res := <-m.svc.Ping(ctx, p):
 		if res.Error != nil {
+			slog.Debug("ping: measuring peer failed", "peer", p, "err", res.Error)
 			return
 		}
 		m.mu.Lock()
@@ -98,7 +102,7 @@ func (m *Manager) Nodes() []NodeInfo {
 				agent = s
 			}
 		}
-		roles, pushPub := cloud.ParseAgent(agent)
+		roles, pushPub := version.ParseAgent(agent)
 		out = append(out, NodeInfo{
 			PeerID:     p.String(),
 			Multiaddr:  conns[0].RemoteMultiaddr().String(),

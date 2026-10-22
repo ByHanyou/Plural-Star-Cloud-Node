@@ -6,30 +6,31 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 
-	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/cloud"
 	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/config"
 	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/network"
 	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/relay"
+	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/version"
 
 	"github.com/gorilla/websocket"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	networkID := s.cfg.NetworkID
-	if networkID == "" && s.cfg.NetworkMode == config.ModePublic {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	cfg := s.config()
+	networkID := cfg.NetworkID
+	if networkID == "" && cfg.NetworkMode == config.ModePublic {
 		networkID = "plural-star-global"
 	}
-	s.mu.RLock()
-	apps := len(s.clients)
-	s.mu.RUnlock()
 
-	roles := s.cfg.Roles()
+	roles := cfg.Roles()
 	pushPub := ""
 	if s.cloud != nil {
 		pushPub = s.cloud.PushBoxPublicKey()
@@ -37,14 +38,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{
 		"status":          "ok",
 		"peer_id":         s.h.ID().String(),
-		"network_mode":    s.cfg.NetworkMode,
+		"network_mode":    cfg.NetworkMode,
 		"network_id":      networkID,
 		"connected_nodes": s.ping.Count(),
-		"connected_apps":  apps,
+		"connected_apps":  s.hub.count(),
 		"uptime_seconds":  int64(time.Since(s.startedAt).Seconds()),
 		"roles":           roles,
-		"agent":           cloud.AgentString(roles, pushPub),
-		"pressure":        cloud.Pressure(),
+		"agent":           version.AgentString(roles, pushPub),
+		"pressure":        pressure(),
+		"version":         version.Version,
 	}
 	if s.cloud != nil {
 		out["cloud"] = s.cloud.HealthFields()
@@ -53,17 +55,24 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	writeJSON(w, http.StatusOK, s.ping.Nodes())
 }
 
 func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	seen := make(map[string]struct{})
 	out := make([]map[string]string, 0)
 
 	self := s.h.ID().String()
-	s.mu.RLock()
-	for c := range s.clients {
-		id := c.appPeer.String()
+	for _, p := range s.hub.appPeers() {
+		id := p.String()
 		if _, dup := seen[id]; dup {
 			continue
 		}
@@ -73,7 +82,6 @@ func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
 			"via_node": self,
 		})
 	}
-	s.mu.RUnlock()
 
 	for _, pr := range s.relay.Router().Snapshot() {
 		id := pr.Peer.String()
@@ -90,6 +98,10 @@ func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleNetworks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	if s.networks == nil {
 		writeJSON(w, http.StatusOK, []any{})
 		return
@@ -113,9 +125,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		Payload   string `json:"payload"`
 		PacketID  string `json:"packet_id,omitempty"`
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSON(w, r, s.config().Limits.MaxSendBodyBytes, &req) {
 		return
 	}
 	recipient, err := peer.Decode(req.Recipient)
@@ -145,16 +155,14 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		}
 		id = gid
 	}
-	var sender peer.ID
-	if req.SenderID != "" {
-		parsed, pErr := peer.Decode(req.SenderID)
-		if pErr != nil {
-			writeError(w, http.StatusBadRequest, "invalid sender_peer_id")
-			return
-		}
-		sender = parsed
-	} else {
-		sender = s.currentAppPeer()
+	if req.SenderID == "" {
+		writeError(w, http.StatusBadRequest, "sender_peer_id is required")
+		return
+	}
+	sender, err := peer.Decode(req.SenderID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid sender_peer_id")
+		return
 	}
 	pkt := &relay.Packet{
 		ID:          id,
@@ -164,33 +172,31 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		Timestamp:   time.Now().UnixMilli(),
 	}
 
-	if rErr := s.relay.Route(pkt); rErr != nil {
-		if !errors.Is(rErr, relay.ErrNoRoute) {
-			log.Printf("api: send %s -> %s failed: %v", sender, recipient, rErr)
-		}
-		if sender != "" {
-			msg := "Recipient not found in routing table"
-			if !errors.Is(rErr, relay.ErrNoRoute) {
-				msg = "Could not forward to recipient's node"
-			}
-			s.sendToApp(sender, errorEvent{
-				Type:    "error",
-				Code:    "SEND_FAILED",
-				Message: msg,
-			})
-		}
+	outcome, err := s.relay.Route(pkt)
+	if err != nil {
+		slog.Warn("api: send failed", "from", sender, "to", recipient, "err", err)
+		writeError(w, http.StatusInternalServerError, "could not route packet")
+		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{
-		"status":    "queued",
+	status := http.StatusOK
+	if outcome == relay.OutcomeForwarded || outcome == relay.OutcomeHeld {
+		status = http.StatusAccepted
+	}
+	writeJSON(w, status, map[string]string{
+		"status":    string(outcome),
 		"packet_id": hex.EncodeToString(id[:]),
 	})
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	if !s.operatorOnly(w, r, false) {
 		return
 	}
-	redacted := *s.cfg
+	redacted := *s.config()
 	redact := func(v *string) {
 		if *v != "" {
 			*v = "***redacted***"
@@ -206,13 +212,9 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 func packetEvent(p *relay.Packet) packetReceivedEvent {
-	sender := ""
-	if sid, e := peer.IDFromBytes(p.SenderID); e == nil {
-		sender = sid.String()
-	}
 	return packetReceivedEvent{
 		Type:         "packet_received",
-		SenderPeerID: sender,
+		SenderPeerID: p.SenderPeerID(),
 		Payload:      base64.StdEncoding.EncodeToString(p.Payload),
 		Timestamp:    p.Timestamp,
 	}
@@ -224,25 +226,25 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing or invalid peer_id query parameter")
 		return
 	}
-	s.mu.RLock()
-	atCapacity := s.cfg.MaxAppConnections > 0 && len(s.clients) >= s.cfg.MaxAppConnections
-	s.mu.RUnlock()
-	if atCapacity {
+	cfg := s.config()
+	if !s.hub.reserve(cfg.MaxAppConnections) {
 		writeError(w, http.StatusServiceUnavailable, "max_app_connections reached")
 		return
 	}
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		s.hub.release()
+		slog.Warn("api: websocket upgrade failed", "peer", appPeer, "err", err)
 		return
 	}
 
-	client := newWSClient(conn, appPeer)
-	s.addClient(client)
+	client := newWSClient(conn, appPeer, cfg.Limits)
+	s.hub.add(client)
 
-	s.broadcast(peerOnlineEvent{Type: "peer_online", PeerID: appPeer.String(), ViaNode: s.h.ID().String()})
+	s.hub.OnAppPeerEvent(appPeer, s.h.ID(), true)
 
 	s.relay.AppConnected(appPeer, func(p *relay.Packet) {
-		s.sendToApp(appPeer, packetEvent(p))
+		s.hub.sendToApp(appPeer, packetEvent(p))
 	})
 
 	if s.cloud != nil {
@@ -251,21 +253,21 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				return true
 			}
-			_ = conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+			_ = conn.SetWriteDeadline(time.Now().Add(cfg.Limits.WSWriteWait.Std()))
 			return conn.WriteMessage(websocket.TextMessage, b) == nil
 		})
 		if replayed > 0 {
-			log.Printf("cloud: replayed %d inbox packet(s) to %s", replayed, appPeer)
+			slog.Info("cloud: replayed inbox packets", "count", replayed, "peer", appPeer)
 		}
 	}
 
 	go client.writePump()
 	client.readPump(func() {
-		s.removeClient(client)
+		s.hub.remove(client)
 		client.close()
-		if !s.hasClientFor(appPeer) {
+		if !s.hub.hasClientFor(appPeer) {
 			s.relay.AppDisconnected(appPeer)
-			s.broadcast(peerOfflineEvent{Type: "peer_offline", PeerID: appPeer.String()})
+			s.hub.OnAppPeerEvent(appPeer, s.h.ID(), false)
 		}
 	})
 }
@@ -278,11 +280,12 @@ func (s *Server) handleInviteGenerate(w http.ResponseWriter, r *http.Request) {
 	if !s.operatorOnly(w, r, false) {
 		return
 	}
-	if s.cfg.NetworkMode != config.ModePrivate {
+	cfg := s.config()
+	if cfg.NetworkMode != config.ModePrivate {
 		writeError(w, http.StatusBadRequest, "invites are only available in private network mode")
 		return
 	}
-	psk, err := network.LoadPSK(s.cfg.PSKPath)
+	psk, err := network.LoadPSK(cfg.PSKPath)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not load psk: "+err.Error())
 		return
@@ -295,7 +298,7 @@ func (s *Server) handleInviteGenerate(w http.ResponseWriter, r *http.Request) {
 	invite, err := network.EncodeInvite(network.Invite{
 		Multiaddrs: p2pAddrs,
 		PSK:        psk,
-		Label:      s.cfg.NetworkID,
+		Label:      cfg.NetworkID,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -315,9 +318,7 @@ func (s *Server) handleInviteAccept(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Invite string `json:"invite"`
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	if !decodeJSON(w, r, s.config().Limits.MaxInviteBodyBytes, &req) {
 		return
 	}
 	inv, err := network.DecodeInvite(req.Invite)
@@ -325,16 +326,82 @@ func (s *Server) handleInviteAccept(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid invite: "+err.Error())
 		return
 	}
-	if err := network.ApplyInvite(s.cfg, inv, s.cfg.PSKPath); err != nil {
+	s.inviteMu.Lock()
+	defer s.inviteMu.Unlock()
+	cur := s.config()
+	next, err := network.ApplyInvite(*cur, inv, cur.PSKPath)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := config.Save(s.cfg, s.configPath); err != nil {
+	if err := config.Save(&next, s.configPath); err != nil {
 		writeError(w, http.StatusInternalServerError, "could not persist config: "+err.Error())
 		return
 	}
+	s.setConfig(&next)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":           "accepted",
 		"restart_required": true,
 	})
+}
+
+func (s *Server) handleRendezvousRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		Namespace string `json:"namespace"`
+		Record    string `json:"record"`
+		TTLSecs   int    `json:"ttl_seconds"`
+	}
+	lim := s.config().Limits
+	if !decodeJSON(w, r, lim.MaxRendezvousBodyBytes, &req) {
+		return
+	}
+	if req.Namespace == "" || req.Record == "" {
+		writeError(w, http.StatusBadRequest, "namespace and record required")
+		return
+	}
+	if len(req.Namespace) > lim.RendezvousMaxNamespaceLen {
+		writeError(w, http.StatusBadRequest, "namespace too long")
+		return
+	}
+	if len(req.Record) > lim.RendezvousMaxRecordBytes {
+		writeError(w, http.StatusBadRequest, "record too large")
+		return
+	}
+	maxTTL := int(lim.RendezvousMaxTTL.Std().Seconds())
+	ttl := req.TTLSecs
+	if ttl <= 0 || ttl > maxTTL {
+		ttl = maxTTL
+	}
+	if !s.rv.put(req.Namespace, req.Record, time.Duration(ttl)*time.Second) {
+		writeError(w, http.StatusServiceUnavailable, "rendezvous full")
+		return
+	}
+	if g := s.gossip; g != nil {
+		if err := g.Announce(req.Namespace, req.Record, time.Now().Add(time.Duration(ttl)*time.Second)); err != nil {
+			slog.Warn("rendezvous: gossip announce failed", "err", err)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleRendezvousLookup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	ns := r.URL.Query().Get("namespace")
+	if ns == "" {
+		writeError(w, http.StatusBadRequest, "namespace required")
+		return
+	}
+	rec, ok := s.rv.get(ns)
+	if !ok {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"record": rec})
 }

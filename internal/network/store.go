@@ -12,6 +12,8 @@ import (
 
 const NetworkDBDefault = "./networks.db"
 
+const openTimeout = 5 * time.Second
+
 var networksBucket = []byte("networks")
 
 type Store struct {
@@ -19,7 +21,7 @@ type Store struct {
 }
 
 func OpenStore(path string) (*Store, error) {
-	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: 5 * time.Second})
+	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: openTimeout})
 	if err != nil {
 		return nil, fmt.Errorf("open network store %q: %w", path, err)
 	}

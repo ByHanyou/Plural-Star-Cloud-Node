@@ -5,11 +5,12 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"log"
+	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,84 +26,112 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
+type Relay interface {
+	Route(*relay.Packet) (relay.Outcome, error)
+	Router() *relay.Router
+	AppConnected(peer.ID, relay.DeliverFunc)
+	AppDisconnected(peer.ID)
+}
+
+type Ping interface {
+	Count() int
+	Nodes() []ping.NodeInfo
+}
+
+type Deps struct {
+	Hub        *Hub
+	Rendezvous *RendezvousStore
+	Ping       Ping
+	Relay      Relay
+	Networks   *network.Store
+	Cloud      *cloud.Service
+	Gossip     *relay.RendezvousGossip
+}
+
 type Server struct {
+	cfgMu      sync.RWMutex
 	cfg        *config.Config
+	inviteMu   sync.Mutex
 	configPath string
 	h          host.Host
-	ping       *ping.Manager
-	relay      *relay.Manager
+	hub        *Hub
+	rv         *RendezvousStore
+	ping       Ping
+	relay      Relay
 	networks   *network.Store
 	cloud      *cloud.Service
-	scope      string
+	gossip     *relay.RendezvousGossip
 	startedAt  time.Time
 
 	httpSrv  *http.Server
 	upgrader websocket.Upgrader
-
-	mu      sync.RWMutex
-	clients map[*wsClient]struct{}
-	appPeer peer.ID
-
-	rv *rendezvousStore
-
-	rvGossipMu sync.RWMutex
-	rvGossip   *relay.RendezvousGossip
 }
 
-func NewServer(cfg *config.Config, configPath string, h host.Host, scope string) *Server {
-	return &Server{
+func New(cfg *config.Config, configPath string, h host.Host, d Deps) (*Server, error) {
+	if cfg == nil {
+		return nil, errors.New("api: config is required")
+	}
+	if h == nil {
+		return nil, errors.New("api: host is required")
+	}
+	if d.Hub == nil || d.Rendezvous == nil || d.Ping == nil || d.Relay == nil {
+		return nil, errors.New("api: hub, rendezvous store, ping and relay are required")
+	}
+	s := &Server{
 		cfg:        cfg,
 		configPath: configPath,
 		h:          h,
-		scope:      scope,
+		hub:        d.Hub,
+		rv:         d.Rendezvous,
+		ping:       d.Ping,
+		relay:      d.Relay,
+		networks:   d.Networks,
+		cloud:      d.Cloud,
+		gossip:     d.Gossip,
 		startedAt:  time.Now(),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: originAllowed,
 		},
-		clients: make(map[*wsClient]struct{}),
-		rv:      newRendezvousStore(rendezvousPathFor(configPath)),
 	}
+	apiHost := cfg.APIHost
+	if apiHost == "" {
+		apiHost = "127.0.0.1"
+	}
+	s.httpSrv = &http.Server{
+		Addr:              net.JoinHostPort(apiHost, strconv.Itoa(cfg.APIPort)),
+		Handler:           s.routes(),
+		ReadHeaderTimeout: cfg.Limits.HTTPReadHeaderTimeout.Std(),
+		IdleTimeout:       cfg.Limits.HTTPIdleTimeout.Std(),
+	}
+	return s, nil
 }
 
-func (s *Server) SetPing(m *ping.Manager) { s.ping = m }
-
-func (s *Server) SetRelay(m *relay.Manager) { s.relay = m }
-
-func (s *Server) SetNetworks(store *network.Store) { s.networks = store }
-
-func (s *Server) SetCloud(svc *cloud.Service) { s.cloud = svc }
-
-func (s *Server) SetRendezvousGossip(g *relay.RendezvousGossip) {
-	s.rvGossipMu.Lock()
-	s.rvGossip = g
-	s.rvGossipMu.Unlock()
+func (s *Server) config() *config.Config {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg
 }
 
-func (s *Server) rendezvousGossip() *relay.RendezvousGossip {
-	s.rvGossipMu.RLock()
-	defer s.rvGossipMu.RUnlock()
-	return s.rvGossip
-}
-
-func (s *Server) OnRemoteRendezvous(namespace, record string, ttl time.Duration) {
-	s.rv.putRemote(namespace, record, ttl)
+func (s *Server) setConfig(cfg *config.Config) {
+	s.cfgMu.Lock()
+	s.cfg = cfg
+	s.cfgMu.Unlock()
 }
 
 func (s *Server) RendezvousReannounceLoop(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Minute)
+	if s.gossip == nil {
+		return
+	}
+	ticker := time.NewTicker(s.config().Limits.RendezvousReannounceInterval.Std())
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			g := s.rendezvousGossip()
-			if g == nil {
-				continue
-			}
 			for _, e := range s.rv.localEntries() {
-				if err := g.Announce(e.Namespace, e.Record, e.ExpiresAt); err != nil {
-					log.Printf("rendezvous: re-announce failed: %v", err)
+				if err := s.gossip.Announce(e.Namespace, e.Record, e.ExpiresAt); err != nil {
+					slog.Warn("rendezvous: re-announce failed", "err", err)
 				}
 			}
 		}
@@ -129,17 +158,17 @@ func (s *Server) routes() http.Handler {
 }
 
 func (s *Server) startDebugServer() {
-	addr := strings.TrimSpace(s.cfg.DebugAddr)
+	addr := strings.TrimSpace(s.config().DebugAddr)
 	if addr == "" {
 		return
 	}
 	h, _, err := net.SplitHostPort(addr)
 	if err != nil {
-		log.Printf("debug_addr %q is not host:port, pprof not started: %v", addr, err)
+		slog.Warn("debug_addr is not host:port, pprof not started", "debug_addr", addr, "err", err)
 		return
 	}
 	if ip := net.ParseIP(h); ip == nil || !ip.IsLoopback() {
-		log.Printf("debug_addr %q is not a loopback address, pprof NOT started (use an SSH tunnel)", addr)
+		slog.Warn("debug_addr is not a loopback address, pprof not started (use an SSH tunnel)", "debug_addr", addr)
 		return
 	}
 	mux := http.NewServeMux()
@@ -149,125 +178,26 @@ func (s *Server) startDebugServer() {
 	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 	go func() {
-		log.Printf("pprof listening on http://%s/debug/pprof/ (loopback only)", addr)
-		srv := &http.Server{Addr: addr, Handler: mux}
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("pprof server stopped: %v", err)
+		slog.Info("pprof listening (loopback only)", "url", "http://"+addr+"/debug/pprof/")
+		srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: s.config().Limits.HTTPReadHeaderTimeout.Std()}
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Warn("pprof server stopped", "err", err)
 		}
 	}()
 }
 
 func (s *Server) Start() error {
 	s.startDebugServer()
-	host := s.cfg.APIHost
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	s.httpSrv = &http.Server{
-		Addr:              fmt.Sprintf("%s:%d", host, s.cfg.APIPort),
-		Handler:           s.routes(),
-		ReadHeaderTimeout: 15 * time.Second,
-		IdleTimeout:       2 * time.Minute,
-	}
-	log.Printf("API server listening on http://%s:%d", host, s.cfg.APIPort)
-	if err := s.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	slog.Info("API server listening", "url", "http://"+s.httpSrv.Addr)
+	if err := s.httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.mu.Lock()
-	for c := range s.clients {
-		c.close()
-	}
-	s.clients = make(map[*wsClient]struct{})
-	s.mu.Unlock()
-	if s.httpSrv == nil {
-		return nil
-	}
+	s.hub.closeAll()
 	return s.httpSrv.Shutdown(ctx)
-}
-
-func (s *Server) OnAppPeerEvent(peerID, viaNode peer.ID, online bool) {
-	if online {
-		s.broadcast(peerOnlineEvent{Type: "peer_online", PeerID: peerID.String(), ViaNode: viaNode.String()})
-	} else {
-		s.broadcast(peerOfflineEvent{Type: "peer_offline", PeerID: peerID.String()})
-	}
-}
-
-func (s *Server) OnNodeEvent(peerID peer.ID, rttMs int64, connected bool) {
-	if connected {
-		s.broadcast(nodeConnectedEvent{Type: "node_connected", NodePeerID: peerID.String(), RTTms: rttMs})
-	} else {
-		s.broadcast(nodeDisconnectedEvent{Type: "node_disconnected", NodePeerID: peerID.String()})
-	}
-}
-
-func (s *Server) broadcast(ev any) {
-	b, err := json.Marshal(ev)
-	if err != nil {
-		return
-	}
-	s.mu.RLock()
-	for c := range s.clients {
-		c.trySend(b)
-	}
-	s.mu.RUnlock()
-}
-
-func (s *Server) sendToApp(appPeer peer.ID, ev any) {
-	b, err := json.Marshal(ev)
-	if err != nil {
-		return
-	}
-	s.mu.RLock()
-	for c := range s.clients {
-		if c.appPeer == appPeer {
-			c.trySend(b)
-		}
-	}
-	s.mu.RUnlock()
-}
-
-func (s *Server) addClient(c *wsClient) {
-	s.mu.Lock()
-	s.clients[c] = struct{}{}
-	s.appPeer = c.appPeer
-	s.mu.Unlock()
-}
-
-func (s *Server) removeClient(c *wsClient) {
-	s.mu.Lock()
-	delete(s.clients, c)
-	if s.appPeer == c.appPeer {
-		s.appPeer = ""
-		for other := range s.clients {
-			if other.appPeer == c.appPeer {
-				s.appPeer = c.appPeer
-				break
-			}
-		}
-	}
-	s.mu.Unlock()
-}
-
-func (s *Server) hasClientFor(appPeer peer.ID) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for c := range s.clients {
-		if c.appPeer == appPeer {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *Server) currentAppPeer() peer.ID {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.appPeer
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -277,5 +207,20 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+	writeJSON(w, status, map[string]string{"error": msg, "code": cloud.CodeForStatus(status)})
+}
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, limit int, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, int64(limit))
+	err := json.NewDecoder(r.Body).Decode(v)
+	if err == nil {
+		return true
+	}
+	var tooBig *http.MaxBytesError
+	if errors.As(err, &tooBig) {
+		writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+	} else {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+	}
+	return false
 }

@@ -4,9 +4,9 @@ package relay
 
 import (
 	"context"
-	"encoding/json"
-	"log"
 	"time"
+
+	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/gossip"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -20,88 +20,47 @@ type rendezvousMsg struct {
 
 type RecordEvent func(namespace, record string, ttl time.Duration)
 
-const (
-	rendezvousMaxNamespaceLen = 128
-	rendezvousMaxRecordLen    = 8 * 1024
-	rendezvousMaxTTL          = time.Hour
-)
-
 type RendezvousGossip struct {
-	ctx      context.Context
-	self     peer.ID
-	topic    *pubsub.Topic
-	sub      *pubsub.Subscription
-	onRecord RecordEvent
+	maxNamespaceLen int
+	maxRecordBytes  int
+	maxTTL          time.Duration
+	topic           *gossip.Topic[rendezvousMsg]
+	onRecord        RecordEvent
 }
 
-func NewRendezvousGossip(ctx context.Context, ps *pubsub.PubSub, self peer.ID, topicName string, onRecord RecordEvent) (*RendezvousGossip, error) {
-	topic, err := ps.Join(topicName)
+func NewRendezvousGossip(ctx context.Context, ps *pubsub.PubSub, self peer.ID, topicName string, maxNamespaceLen, maxRecordBytes int, maxTTL time.Duration, onRecord RecordEvent) (*RendezvousGossip, error) {
+	g := &RendezvousGossip{maxNamespaceLen: maxNamespaceLen, maxRecordBytes: maxRecordBytes, maxTTL: maxTTL, onRecord: onRecord}
+	topic, err := gossip.Join(ctx, ps, self, topicName, g.receive)
 	if err != nil {
 		return nil, err
 	}
-	sub, err := topic.Subscribe()
-	if err != nil {
-		return nil, err
-	}
-	g := &RendezvousGossip{
-		ctx:      ctx,
-		self:     self,
-		topic:    topic,
-		sub:      sub,
-		onRecord: onRecord,
-	}
-	go g.readLoop()
+	g.topic = topic
 	return g, nil
 }
 
 func (g *RendezvousGossip) Announce(namespace, record string, expiresAt time.Time) error {
-	m := rendezvousMsg{
+	return g.topic.Publish(rendezvousMsg{
 		Namespace: namespace,
 		Record:    record,
 		ExpiresAt: expiresAt.UnixMilli(),
-	}
-	b, err := json.Marshal(m)
-	if err != nil {
-		return err
-	}
-	return g.topic.Publish(g.ctx, b)
+	})
 }
 
-func (g *RendezvousGossip) readLoop() {
-	for {
-		msg, err := g.sub.Next(g.ctx)
-		if err != nil {
-			return
-		}
-		if msg.ReceivedFrom == g.self {
-			continue
-		}
-		var m rendezvousMsg
-		if err := json.Unmarshal(msg.Data, &m); err != nil {
-			continue
-		}
-		if m.Namespace == "" || len(m.Namespace) > rendezvousMaxNamespaceLen {
-			continue
-		}
-		if m.Record == "" || len(m.Record) > rendezvousMaxRecordLen {
-			continue
-		}
-		ttl := time.Until(time.UnixMilli(m.ExpiresAt))
-		if ttl <= 0 {
-			continue
-		}
-		if ttl > rendezvousMaxTTL {
-			ttl = rendezvousMaxTTL
-		}
-		if g.onRecord != nil {
-			func() {
-				defer func() {
-					if r := recover(); r != nil {
-						log.Printf("rendezvous: onRecord callback panicked: %v", r)
-					}
-				}()
-				g.onRecord(m.Namespace, m.Record, ttl)
-			}()
-		}
+func (g *RendezvousGossip) receive(_ peer.ID, m rendezvousMsg) {
+	if m.Namespace == "" || len(m.Namespace) > g.maxNamespaceLen {
+		return
+	}
+	if m.Record == "" || len(m.Record) > g.maxRecordBytes {
+		return
+	}
+	ttl := time.Until(time.UnixMilli(m.ExpiresAt))
+	if ttl <= 0 {
+		return
+	}
+	if ttl > g.maxTTL {
+		ttl = g.maxTTL
+	}
+	if g.onRecord != nil {
+		g.onRecord(m.Namespace, m.Record, ttl)
 	}
 }

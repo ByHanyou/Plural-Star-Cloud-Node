@@ -10,12 +10,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/config"
 	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/host"
 	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/network"
 )
 
 func main() {
-	key := flag.String("key", "./node.key", "Ed25519 key used to sign (created if absent)")
+	key := flag.String("key", config.DefaultKeypairPath, "Ed25519 key used to sign (created if absent)")
 	id := flag.String("id", "", "network id, e.g. plural-star-global")
 	name := flag.String("name", "", "human-readable network name")
 	desc := flag.String("desc", "", "description")

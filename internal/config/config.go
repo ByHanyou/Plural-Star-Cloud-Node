@@ -3,9 +3,11 @@
 package config
 
 import (
+	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -16,7 +18,18 @@ const (
 	ModeCustomPublic = "custom_public"
 )
 
-const DefaultAPIPort = 7523
+const (
+	DefaultAPIPort     = 7523
+	DefaultKeypairPath = "./node.key"
+	DefaultPSKPath     = "./network.psk"
+)
+
+const (
+	LogLevelDebug = "debug"
+	LogLevelInfo  = "info"
+	LogLevelWarn  = "warn"
+	LogLevelError = "error"
+)
 
 type Config struct {
 	KeypairPath string `yaml:"keypair_path" json:"keypair_path"`
@@ -48,116 +61,17 @@ type Config struct {
 	MaxAppConnections int `yaml:"max_app_connections" json:"max_app_connections"`
 
 	Cloud CloudConfig `yaml:"cloud" json:"cloud"`
-}
 
-type CloudConfig struct {
-	Enabled          bool   `yaml:"enabled" json:"enabled"`
-	StoragePath      string `yaml:"storage_path" json:"storage_path"`
-	MediaBackend     string `yaml:"media_backend" json:"media_backend"`
-	RemoteBlobURL    string `yaml:"remote_blob_url" json:"remote_blob_url"`
-	RemoteBlobSecret string `yaml:"remote_blob_secret" json:"remote_blob_secret"`
-	BlobServeSecret  string `yaml:"blob_serve_secret" json:"blob_serve_secret"`
-	S3Endpoint       string `yaml:"s3_endpoint" json:"s3_endpoint"`
-	S3Region         string `yaml:"s3_region" json:"s3_region"`
-	S3Bucket         string `yaml:"s3_bucket" json:"s3_bucket"`
-	S3Prefix         string `yaml:"s3_prefix" json:"s3_prefix"`
-	S3AccessKey      string `yaml:"s3_access_key" json:"s3_access_key"`
-	S3SecretKey      string `yaml:"s3_secret_key" json:"s3_secret_key"`
-	WatermarkPercent int    `yaml:"watermark_percent" json:"watermark_percent"`
-	BaseQuotaMB      int    `yaml:"base_quota_mb" json:"base_quota_mb"`
-	MediaQuotaMB     int    `yaml:"media_quota_mb" json:"media_quota_mb"`
-	ObjectMaxMB      int    `yaml:"object_max_mb" json:"object_max_mb"`
-	ManifestVersions int    `yaml:"manifest_versions" json:"manifest_versions"`
-	InboxTTLDays     int    `yaml:"inbox_ttl_days" json:"inbox_ttl_days"`
-	InboxQuotaMB     int    `yaml:"inbox_quota_mb" json:"inbox_quota_mb"`
-	GraceDays        int    `yaml:"grace_days" json:"grace_days"`
-	GCHourUTC        int    `yaml:"gc_hour_utc" json:"gc_hour_utc"`
-	PushForwardURL   string `yaml:"push_forward_url" json:"push_forward_url"`
-	PushForwardToken string `yaml:"push_forward_token" json:"push_forward_token"`
-	PushBoxKeyPath   string `yaml:"push_box_key_path" json:"push_box_key_path"`
-}
+	LogLevel string `yaml:"log_level" json:"log_level"`
 
-const (
-	MediaBackendLocal  = "local"
-	MediaBackendRemote = "remote"
-	MediaBackendS3     = "s3"
-)
-
-func DefaultCloud() CloudConfig {
-	return CloudConfig{
-		Enabled:          false,
-		StoragePath:      "./cloud",
-		MediaBackend:     MediaBackendLocal,
-		RemoteBlobURL:    "",
-		RemoteBlobSecret: "",
-		BlobServeSecret:  "",
-		S3Endpoint:       "",
-		S3Region:         "us-east-1",
-		S3Bucket:         "",
-		S3Prefix:         "",
-		S3AccessKey:      "",
-		S3SecretKey:      "",
-		WatermarkPercent: 90,
-		BaseQuotaMB:      200,
-		MediaQuotaMB:     1024,
-		ObjectMaxMB:      25,
-		ManifestVersions: 30,
-		InboxTTLDays:     30,
-		InboxQuotaMB:     50,
-		GraceDays:        30,
-		GCHourUTC:        4,
-		PushForwardURL:   "",
-		PushForwardToken: "",
-		PushBoxKeyPath:   "./push.key",
-	}
-}
-
-func (c *CloudConfig) Validate() error {
-	if !c.Enabled {
-		return nil
-	}
-	if c.StoragePath == "" {
-		return fmt.Errorf("cloud.storage_path is required when cloud.enabled is true")
-	}
-	switch c.MediaBackend {
-	case MediaBackendLocal:
-	case MediaBackendRemote:
-		if c.RemoteBlobURL == "" || c.RemoteBlobSecret == "" {
-			return fmt.Errorf("cloud.media_backend=remote requires remote_blob_url and remote_blob_secret")
-		}
-	case MediaBackendS3:
-		if c.S3Endpoint == "" || c.S3Bucket == "" || c.S3AccessKey == "" || c.S3SecretKey == "" {
-			return fmt.Errorf("cloud.media_backend=s3 requires s3_endpoint, s3_bucket, s3_access_key and s3_secret_key")
-		}
-	default:
-		return fmt.Errorf("invalid cloud.media_backend %q (want local, remote, or s3)", c.MediaBackend)
-	}
-	if c.WatermarkPercent < 50 || c.WatermarkPercent > 99 {
-		return fmt.Errorf("cloud.watermark_percent %d out of range (50-99)", c.WatermarkPercent)
-	}
-	if c.BaseQuotaMB <= 0 || c.MediaQuotaMB <= 0 || c.ObjectMaxMB <= 0 {
-		return fmt.Errorf("cloud quotas must be positive")
-	}
-	if c.ManifestVersions <= 0 {
-		return fmt.Errorf("cloud.manifest_versions must be positive")
-	}
-	if c.InboxTTLDays <= 0 || c.InboxQuotaMB <= 0 {
-		return fmt.Errorf("cloud.inbox_ttl_days and cloud.inbox_quota_mb must be positive")
-	}
-	if c.GraceDays <= 0 {
-		return fmt.Errorf("cloud.grace_days must be positive")
-	}
-	if c.GCHourUTC < 0 || c.GCHourUTC > 23 {
-		return fmt.Errorf("cloud.gc_hour_utc %d out of range (0-23)", c.GCHourUTC)
-	}
-	return nil
+	Limits Limits `yaml:"limits" json:"limits"`
 }
 
 func Default() *Config {
 	return &Config{
-		KeypairPath:    "./node.key",
+		KeypairPath:    DefaultKeypairPath,
 		NetworkMode:    ModePublic,
-		PSKPath:        "./network.psk",
+		PSKPath:        DefaultPSKPath,
 		NetworkID:      "",
 		BootstrapPeers: []string{},
 		DirectoryURL:   "",
@@ -173,13 +87,15 @@ func Default() *Config {
 		MaxPeers:          200,
 		MaxAppConnections: 5000,
 		Cloud:             DefaultCloud(),
+		LogLevel:          LogLevelInfo,
+		Limits:            DefaultLimits(),
 	}
 }
 
 func Load(path string) (cfg *Config, firstRun bool, err error) {
 	data, readErr := os.ReadFile(path)
 	if readErr != nil {
-		if !os.IsNotExist(readErr) {
+		if !errors.Is(readErr, os.ErrNotExist) {
 			return nil, false, fmt.Errorf("read config %q: %w", path, readErr)
 		}
 		cfg = Default()
@@ -199,7 +115,7 @@ func Load(path string) (cfg *Config, firstRun bool, err error) {
 
 	if cfg.NetworkMode == ModePublic && cfg.APIToken != "" {
 		cfg.APIToken = ""
-		log.Printf("config: api_token ignored and removed from %s. A public node must stay open or it locks out every app on the default network.", path)
+		slog.Warn("config: api_token ignored and removed; a public node must stay open or it locks out every app on the default network", "path", path)
 		if err := Save(cfg, path); err != nil {
 			return nil, false, fmt.Errorf("clear api_token in %q: %w", path, err)
 		}
@@ -208,7 +124,7 @@ func Load(path string) (cfg *Config, firstRun bool, err error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, false, err
 	}
-	return cfg, firstRun, nil
+	return cfg, false, nil
 }
 
 func Save(cfg *Config, path string) error {
@@ -244,6 +160,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid network_mode %q (want public, private, or custom_public)", c.NetworkMode)
 	}
 
+	if c.KeypairPath == "" {
+		return fmt.Errorf("keypair_path is required")
+	}
 	if c.APIPort <= 0 || c.APIPort > 65535 {
 		return fmt.Errorf("api_port %d out of range", c.APIPort)
 	}
@@ -256,7 +175,21 @@ func (c *Config) Validate() error {
 	if c.MaxAppConnections <= 0 {
 		return fmt.Errorf("max_app_connections must be positive")
 	}
+	if !ValidLogLevel(c.LogLevel) {
+		return fmt.Errorf("invalid log_level %q (want debug, info, warn, or error)", c.LogLevel)
+	}
+	if err := c.Limits.Validate(); err != nil {
+		return err
+	}
 	return c.Cloud.Validate()
+}
+
+func ValidLogLevel(level string) bool {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case LogLevelDebug, LogLevelInfo, LogLevelWarn, LogLevelError:
+		return true
+	}
+	return false
 }
 
 func (c *Config) Roles() []string {

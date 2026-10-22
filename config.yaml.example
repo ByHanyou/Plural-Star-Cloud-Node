@@ -16,6 +16,8 @@ api_host: "127.0.0.1"
 api_port: 7523
 api_token: ""
 
+debug_addr: ""
+
 listen_addrs:
   - "/ip4/0.0.0.0/tcp/4001"
   - "/ip4/0.0.0.0/udp/4001/quic-v1"
@@ -26,6 +28,67 @@ relay_enabled: true
 
 max_peers: 200
 max_app_connections: 5000
+
+log_level: "info"
+
+limits:
+  reconnect_interval: "90s"
+  connection_monitor_interval: "5m"
+  dial_concurrency: 8
+  dial_timeout: "15s"
+  connmgr_grace_period: "1m"
+  ping_timeout: "10s"
+  discovery_interval: "60s"
+  discovery_dial_timeout: "20s"
+  directory_fetch_timeout: "15s"
+  peer_memory_max_peers: 64
+  peer_memory_max_addrs: 8
+  peer_memory_ttl: "720h"
+
+  max_packet_bytes: 2097152
+  relay_stream_timeout: "15s"
+  presence_ttl: "90s"
+  max_presence_ttl: "10m"
+  presence_refresh_interval: "45s"
+  dedup_cache_ttl: "10s"
+  dedup_evict_interval: "5s"
+  routing_prune_interval: "30s"
+  queue_entry_ttl: "168h"
+  queue_max_senders: 500
+  queue_max_recipients: 10000
+  queue_max_bytes: 67108864
+  queue_sweep_interval: "30m"
+
+  rendezvous_max_entries: 20000
+  rendezvous_max_namespace_len: 128
+  rendezvous_max_record_bytes: 8192
+  rendezvous_max_ttl: "1h"
+  rendezvous_reannounce_interval: "5m"
+  ws_write_wait: "10s"
+  ws_pong_wait: "60s"
+  ws_ping_period: "50s"
+  ws_send_buffer: 64
+  ws_max_message_bytes: 65536
+  http_read_header_timeout: "15s"
+  http_idle_timeout: "2m"
+  shutdown_timeout: "5s"
+  max_send_body_bytes: 1048576
+  max_invite_body_bytes: 65536
+  max_rendezvous_body_bytes: 65536
+
+  auth_timestamp_skew: "10m"
+  max_json_body_bytes: 65536
+  max_manifest_body_bytes: 33554432
+  rate_limit_per_address_per_minute: 10
+  rate_limit_per_vault_per_hour: 20
+  gc_object_grace: "24h"
+  front_max_age: "720h"
+  push_register_ttl: "168h"
+  push_event_ttl: "12h"
+  push_max_body_bytes: 16384
+  push_max_backoff: "5m"
+  push_http_timeout: "30s"
+  blob_http_timeout: "10m"
 
 cloud:
   enabled: false

@@ -4,10 +4,9 @@ package relay
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"log"
 	"time"
+
+	"github.com/ByHanyou/Plural-Star-Cloud-Node/internal/gossip"
 
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -24,117 +23,70 @@ type presenceMsg struct {
 type PeerEvent func(peerID, viaNode peer.ID, online bool)
 
 type Presence struct {
-	ctx    context.Context
 	self   peer.ID
-	topic  *pubsub.Topic
-	sub    *pubsub.Subscription
+	topic  *gossip.Topic[presenceMsg]
 	router *Router
 	ttl    time.Duration
+	maxTTL time.Duration
 	onPeer PeerEvent
 }
 
-func NewPresence(ctx context.Context, ps *pubsub.PubSub, self peer.ID, topicName string, router *Router, ttl time.Duration, onPeer PeerEvent) (*Presence, error) {
-	topic, err := ps.Join(topicName)
+func NewPresence(ctx context.Context, ps *pubsub.PubSub, self peer.ID, topicName string, router *Router, ttl, maxTTL time.Duration, onPeer PeerEvent) (*Presence, error) {
+	p := &Presence{self: self, router: router, ttl: ttl, maxTTL: maxTTL, onPeer: onPeer}
+	topic, err := gossip.Join(ctx, ps, self, topicName, p.receive)
 	if err != nil {
-		return nil, fmt.Errorf("join presence topic %q: %w", topicName, err)
+		return nil, err
 	}
-	sub, err := topic.Subscribe()
-	if err != nil {
-		return nil, fmt.Errorf("subscribe presence topic: %w", err)
-	}
-	p := &Presence{
-		ctx:    ctx,
-		self:   self,
-		topic:  topic,
-		sub:    sub,
-		router: router,
-		ttl:    ttl,
-		onPeer: onPeer,
-	}
-	go p.readLoop()
+	p.topic = topic
 	return p, nil
 }
 
 func (p *Presence) Announce(appPeer peer.ID) error {
-	m := presenceMsg{
+	return p.topic.Publish(presenceMsg{
 		PeerID:     appPeer.String(),
 		ViaNode:    p.self.String(),
 		TTLSeconds: int(p.ttl.Seconds()),
 		Timestamp:  time.Now().UnixMilli(),
-	}
-	return p.publish(m)
+	})
 }
 
 func (p *Presence) Tombstone(appPeer peer.ID) error {
-	m := presenceMsg{
+	return p.topic.Publish(presenceMsg{
 		PeerID:    appPeer.String(),
 		ViaNode:   p.self.String(),
 		Tombstone: true,
-	}
-	return p.publish(m)
+	})
 }
 
-func (p *Presence) publish(m presenceMsg) error {
-	b, err := json.Marshal(m)
+func (p *Presence) receive(via peer.ID, m presenceMsg) {
+	appPeer, err := peer.Decode(m.PeerID)
 	if err != nil {
-		return err
+		return
 	}
-	return p.topic.Publish(p.ctx, b)
-}
-
-func (p *Presence) readLoop() {
-	for {
-		msg, err := p.sub.Next(p.ctx)
-		if err != nil {
+	if m.ViaNode != "" && m.ViaNode != via.String() {
+		return
+	}
+	if m.Tombstone {
+		if cur, ok := p.router.Lookup(appPeer); !ok || cur != via {
 			return
 		}
-		if msg.ReceivedFrom == p.self {
-			continue
-		}
-		var m presenceMsg
-		if err := json.Unmarshal(msg.Data, &m); err != nil {
-			continue
-		}
-		appPeer, err := peer.Decode(m.PeerID)
-		if err != nil {
-			continue
-		}
-		via := msg.GetFrom()
-		if via == "" {
-			continue
-		}
-		if m.ViaNode != "" && m.ViaNode != via.String() {
-			continue
-		}
-		if m.Tombstone {
-			if cur, ok := p.router.Lookup(appPeer); !ok || cur != via {
-				continue
-			}
-			p.router.Remove(appPeer)
-			p.fire(appPeer, via, false)
-			continue
-		}
-		ttl := time.Duration(m.TTLSeconds) * time.Second
-		if ttl <= 0 {
-			ttl = p.ttl
-		}
-		if ttl > MaxPresenceTTL {
-			ttl = MaxPresenceTTL
-		}
-		p.router.Upsert(appPeer, via, ttl)
-		p.fire(appPeer, via, true)
+		p.router.Remove(appPeer)
+		p.fire(appPeer, via, false)
+		return
 	}
+	ttl := time.Duration(m.TTLSeconds) * time.Second
+	if ttl <= 0 {
+		ttl = p.ttl
+	}
+	if ttl > p.maxTTL {
+		ttl = p.maxTTL
+	}
+	p.router.Upsert(appPeer, via, ttl)
+	p.fire(appPeer, via, true)
 }
 
 func (p *Presence) fire(appPeer, via peer.ID, online bool) {
 	if p.onPeer != nil {
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("presence: onPeer callback panicked: %v", r)
-				}
-			}()
-			p.onPeer(appPeer, via, online)
-		}()
+		p.onPeer(appPeer, via, online)
 	}
 }

@@ -56,7 +56,7 @@ make build
 Without `make`:
 
 ```sh
-CGO_ENABLED=0 go build -o plural-star-cloud-node ./cmd/node
+CGO_ENABLED=0 go build -ldflags "-X github.com/ByHanyou/Plural-Star-Cloud-Node/internal/version.Version=$(git describe --tags --always --dirty)" -o plural-star-cloud-node ./cmd/node
 ```
 
 Windows (`cmd` or PowerShell):
@@ -66,7 +66,9 @@ go build -o plural-star-cloud-node.exe ./cmd/node
 plural-star-cloud-node.exe --config config.yaml
 ```
 
-`make dist` cross-compiles fully static binaries for every release target into `dist/`: linux amd64, linux arm64 (Pi 4/5), linux armv7 (Pi 3), macOS arm64, windows amd64.
+`make build` and the `go build` line above stamp the version from `git describe` into the binary. `plural-star-cloud-node -version` prints it and `/health` reports it as `version`; a binary built without the `-ldflags` flag reports `dev`.
+
+`make dist` cross-compiles fully static, version-stamped binaries for every release target into `dist/`: linux amd64, linux arm64 (Pi 4/5), linux armv7 (Pi 3), macOS arm64, windows amd64.
 
 On first run with no config the node writes a default `config.yaml` (public mode) and generates an Ed25519 identity in `node.key`. Keep `node.key`: it is the node's peer ID, and the address other nodes and apps use to reach it.
 
@@ -100,7 +102,7 @@ api_host: "0.0.0.0"
 api_token: "<a long random secret>"
 ```
 
-`bootstrap_peers` must have at least one entry in private mode. On the first and only node of a network, list the node's own address: it is logged at startup as `node peer ID: 12D3Koo...`, and the self-dial is skipped harmlessly. Later nodes list the first node instead.
+`bootstrap_peers` must have at least one entry in private mode. On the first and only node of a network, list the node's own address: its peer ID is logged at startup on the `node identity` line as `peer_id=12D3Koo...`, and the self-dial is skipped harmlessly. Later nodes list the first node instead.
 
 `api_host: "0.0.0.0"` lets apps on other machines reach the API. `api_token` gates every endpoint, so set the same token in each app. A token is honoured on `private` and `custom_public` networks only. On a `public` node it is stripped and rewritten to `""` on load, with a log line saying so, because apps on the default network have no token and setting one there locks every one of them out.
 
@@ -134,7 +136,7 @@ cloud:
 
 Apps detect cloud support by reading `/health` of the node they are on; nothing else needs configuring on the app side. With it on, the node keeps packets for offline apps on disk (newest packet per sender per recipient, 30 days, 50 MB per recipient by default) instead of in memory, serves encrypted vault backups with per-vault quotas, caches signed front announcements, and relays push registrations to a push gateway if `push_forward_url` is set. Vault data can grow large: on a deployed node put `storage_path` on the data volume. The X25519 key in `push.key` is generated on first start and must be backed up, because a regenerated key orphans anything sealed to the old one.
 
-All `cloud.*` fields are documented in `config.yaml.example`.
+Every `cloud.*` field is listed at its default in `config.yaml.example`, and the Configuration table below says what each group does.
 
 ## Configuration
 
@@ -155,7 +157,9 @@ See `config.yaml.example`. Key fields:
 | `relay_enabled` | whether this node forwards traffic for others |
 | `max_peers` / `max_app_connections` | connection limits |
 | `debug_addr` | optional pprof listener; loopback addresses only, refused otherwise |
+| `log_level` | `debug`, `info` (default), `warn` or `error`; log lines go to stderr |
 | `cloud.*` | cloud role, storage path, media backend (`local`, `remote`, `s3`), quotas, inbox retention, GC hour, push forwarding |
+| `limits.*` | every timeout, interval, cap and quota the node enforces: reconnect and discovery timing, relay queue size and retention, rendezvous caps, WebSocket and HTTP timing, request body sizes, signed-timestamp skew, lookup rate limits, GC grace, push relay TTLs. Durations are strings with a unit (`"90s"`, `"5m"`, `"720h"`); any key left out keeps its default; `config.yaml.example` lists every key at its default |
 
 Paths: `keypair_path` and `psk_path` resolve against the process working directory; `cloud.storage_path` and `cloud.push_box_key_path` resolve against the directory the config file lives in. Use absolute paths on any deployed node.
 
@@ -171,11 +175,11 @@ When `api_token` is set, all endpoints require `Authorization: Bearer <api_token
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/health` | Status, peer ID, mode, network ID, connected node/app counts, uptime, `roles`, `agent`, `pressure`, and a `cloud` block when the cloud role is on |
+| GET | `/health` | Status, peer ID, mode, network ID, connected node/app counts, uptime, `roles`, `agent`, `version`, `pressure`, and a `cloud` block when the cloud role is on |
 | GET | `/nodes` | Connected libp2p nodes with RTT and roles |
 | GET | `/peers` | Known online app peers (from the routing table) |
 | GET | `/networks` | Known public networks (from the discovery cache) |
-| POST | `/send` | Send a packet: `{recipient_peer_id, payload(base64), packet_id?}` → `{status:"queued", packet_id}` (best-effort). Reuse the returned `packet_id` when sending the same packet through other nodes so duplicates are deduped end-to-end |
+| POST | `/send` | Send a packet: `{sender_peer_id, recipient_peer_id, payload(base64), packet_id?}` → `{status, packet_id}`. `status` says what the node did: `delivered` (an app with that peer id is connected to this node; 200), `forwarded` (handed to the recipient's node; 202), `held` (no route right now, kept for later delivery; 202) or `duplicate` (this `packet_id` was routed before; 200). Reuse the returned `packet_id` when sending the same packet through other nodes so duplicates are deduped end-to-end |
 | POST | `/invite/generate` | Generate a private-network invite (private mode only). Operator only: needs the `api_token`, or a caller on the local machine when none is set |
 | POST | `/invite/accept` | Accept an invite; writes PSK + bootstrap, requires restart. Operator only (as above) and the body must be sent as `application/json` |
 | GET | `/config` | Current config (secrets redacted). Operator only (as above) |
@@ -183,9 +187,11 @@ When `api_token` is set, all endpoints require `Authorization: Bearer <api_token
 | GET | `/rendezvous/lookup` | Look up pairing records: `?namespace=<ns>` |
 | GET | `/ws` | WebSocket; pass `?peer_id=<app peer id>` to register |
 
-WebSocket events (node → app), each a JSON object with a `type`: `packet_received`, `peer_online`, `peer_offline`, `node_connected`, `node_disconnected`, `error`.
+WebSocket events (node → app), each a JSON object with a `type`: `packet_received`, `peer_online`, `peer_offline`, `node_connected`, `node_disconnected`.
 
-With the cloud role on, `/cloud/*` is added: `vault/lookup`, `vault/create`, `vault/info`, `vault/manifest`, `vault/objects/{id}`, `vault/devices`, `vault/rewrap`, `inbox`, `front/{peer_id}`, `push/register`, `push/event`, and `blob/*` on a node that serves its blob store to another node.
+With the cloud role on, `/cloud/*` is added: `vault/lookup`, `vault/create`, `vault/info`, `vault/manifest`, `vault/objects/{id}`, `vault/devices`, `vault/rewrap`, `inbox`, `front/{peer_id}`, `push/register`, `push/event`, and `blob/*` on a node that serves its blob store to another node. The `blob/*` routes are authenticated with `cloud.blob_serve_secret` instead of `api_token`, and exist only when that secret is set.
+
+Every error body is `{"error": "<text>", "code": "<MACHINE_CODE>"}`; the codes are listed in [`protocol/errors.md`](protocol/errors.md). Request sizes, quotas, timeouts, rate limits and the signed-string formats are in [`protocol/limits.md`](protocol/limits.md).
 
 ## Running as a service
 
@@ -201,7 +207,7 @@ sudo install -d -o plural-star -g plural-star -m 750 /etc/plural-star-cloud-node
 sudo systemctl enable --now plural-star-cloud-node
 ```
 
-Both directories must be owned by `plural-star`: the first start writes `config.yaml` next to the config path, and `node.key`, `network.psk`, `known_peers.json`, `rendezvous.json`, the cloud storage root and `push.key` resolve relative to it unless the config uses absolute paths. Put `config.yaml`, `node.key`, and `network.psk` in `/etc/plural-star-cloud-node/`, owned by `plural-star`, and use absolute paths in the config.
+Both directories must be owned by `plural-star`: the first start writes `config.yaml` at the config path, `known_peers.json`, `rendezvous.json`, the cloud storage root and `push.key` are written next to it, and `node.key`, `network.psk` and `networks.db` resolve relative to the working directory (`WorkingDirectory` in the unit) unless the config uses absolute paths. Put `config.yaml`, `node.key`, and `network.psk` in `/etc/plural-star-cloud-node/`, owned by `plural-star`, and use absolute paths in the config.
 
 ### Windows
 
@@ -227,12 +233,17 @@ internal/config     config load/validate + first-run generation
 internal/host       go-libp2p host, identity, DHT, peer memory
 internal/network    network modes, mDNS + DHT discovery, invites,
                     signed network cards, bbolt cache
-internal/relay      packet, dedup cache, routing table, presence gossip,
-                    in-memory queue, /plural-star/relay/1.0.0 stream handler
+internal/gossip     typed GossipSub topics, malformed-message counting
+internal/relay      packet, dedup cache, routing table, presence and
+                    rendezvous gossip, in-memory queue,
+                    /plural-star/relay/1.0.0 stream handler
 internal/ping       connected-node tracking + RTT (libp2p ping)
 internal/api        REST + WebSocket server, bearer auth, rendezvous
 internal/cloud      inbox, vault, objects, blob backends (local/remote/s3),
                     front cache, push relay, quotas, GC
+internal/ttlmap     expiring map behind the routing table, dedup cache
+                    and rendezvous store
+internal/version    build version, stamped by -ldflags; node agent string
 ```
 
 ## Security model
@@ -241,7 +252,7 @@ Relay nodes are untrusted. They route on `RecipientID` and never inspect `Payloa
 
 ## Privacy & data
 
-The node stores no personal data. It handles libp2p peer IDs of connected apps (kept in memory, never written to disk; peer IDs of other nodes are cached on disk with their public addresses so the mesh can redial itself after an outage) and encrypted payloads (passed through opaquely, never inspected or logged). The files a node writes are operational: its own keypair (`node.key`), config (`config.yaml`), an optional private-network PSK (`network.psk`), a cache of public network cards (`networks.db`), a cache of recently connected node peers (`known_peers.json`), and persisted pairing-directory records (`rendezvous.json`). With the cloud role on it also writes, under `cloud.storage_path`, the encrypted inbox packets, vault manifests and objects, signed front records, queued push events, and the push box key (`push.key`).
+The node stores no personal data. It handles libp2p peer IDs of connected apps (kept in memory, and written to disk only by the cloud role's inbox, front cache and push queue; peer IDs of other nodes are cached on disk with their public addresses so the mesh can redial itself after an outage) and encrypted payloads (passed through opaquely, never inspected or logged). The files a node writes are operational: its own keypair (`node.key`), config (`config.yaml`), an optional private-network PSK (`network.psk`), a cache of public network cards (`networks.db`), a cache of recently connected node peers (`known_peers.json`), and persisted pairing-directory records (`rendezvous.json`). With the cloud role on it also writes, under `cloud.storage_path`, the encrypted inbox packets, vault manifests and objects, signed front records and queued push events, and, at `cloud.push_box_key_path`, the push box key (`push.key`).
 
 Because the node neither collects nor stores personal data, it does not by itself require a formal privacy policy. The operator of a private network may still want to tell their members what the node logs and keeps. A full privacy policy belongs with the Plural Star app, which handles user content.
 

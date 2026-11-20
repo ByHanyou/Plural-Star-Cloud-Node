@@ -18,6 +18,7 @@ type Packet struct {
 	RecipientID []byte   `msgpack:"recipient"`
 	Payload     []byte   `msgpack:"payload"`
 	Timestamp   int64    `msgpack:"ts"`
+	Ephemeral   bool     `msgpack:"ephemeral,omitempty"`
 }
 
 func NewPacketID() ([16]byte, error) {

@@ -19,10 +19,12 @@ import (
 	"github.com/libp2p/go-libp2p/core/test"
 )
 
-func postSend(t *testing.T, s *Server, body string) (*httptest.ResponseRecorder, map[string]any) {
+func postSend(t *testing.T, s *Server, session, body string) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	s.handleSend(rec, httptest.NewRequest(http.MethodPost, "/send", strings.NewReader(body)))
+	req := httptest.NewRequest(http.MethodPost, "/send", strings.NewReader(body))
+	req.Header.Set("X-Relay-Session", session)
+	s.handleSend(rec, req)
 	out := map[string]any{}
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatalf("response is not JSON: %q", rec.Body.String())
@@ -38,48 +40,44 @@ func TestNewRequiresDeps(t *testing.T) {
 
 func TestHandleSendOutcomes(t *testing.T) {
 	s, fr, _ := newTestServer(t, &config.Config{})
-	sender := test.RandPeerIDFatal(t).String()
+	ts := httptest.NewServer(s.routes())
+	defer ts.Close()
+	app, key := appIdentity(t)
+	sender := app.String()
+	socket, session := connectApp(t, "ws"+strings.TrimPrefix(ts.URL, "http")+"/ws?peer_id="+sender, key)
 	recipient := test.RandPeerIDFatal(t).String()
 	payload := base64.StdEncoding.EncodeToString([]byte("sealed"))
 	body := func(extra string) string {
 		return `{"sender_peer_id":"` + sender + `","recipient_peer_id":"` + recipient + `","payload":"` + payload + `"` + extra + `}`
 	}
 
-	for _, c := range []struct {
-		outcome relay.Outcome
-		status  int
-	}{
-		{relay.OutcomeDelivered, http.StatusOK},
-		{relay.OutcomeDuplicate, http.StatusOK},
-		{relay.OutcomeForwarded, http.StatusAccepted},
-		{relay.OutcomeHeld, http.StatusAccepted},
-	} {
-		fr.outcome = c.outcome
-		rec, out := postSend(t, s, body(""))
-		if rec.Code != c.status || out["status"] != string(c.outcome) {
-			t.Fatalf("%s: status %d body %v", c.outcome, rec.Code, out)
+	for _, outcome := range []relay.Outcome{relay.OutcomeDelivered, relay.OutcomeDuplicate, relay.OutcomeForwarded, relay.OutcomeHeld} {
+		fr.outcome = outcome
+		rec, out := postSend(t, s, session, body(""))
+		if rec.Code != http.StatusAccepted || out["status"] != "queued" {
+			t.Fatalf("%s: status %d body %v", outcome, rec.Code, out)
 		}
 		if id, _ := out["packet_id"].(string); len(id) != 32 {
-			t.Fatalf("%s: packet_id %q", c.outcome, id)
+			t.Fatalf("%s: packet_id %q", outcome, id)
 		}
 	}
 
 	fr.outcome = relay.OutcomeDelivered
 	id := strings.Repeat("ab", 16)
-	rec, out := postSend(t, s, body(`,"packet_id":"`+id+`"`))
-	if rec.Code != http.StatusOK || out["packet_id"] != id {
+	rec, out := postSend(t, s, session, body(`,"packet_id":"`+id+`","ephemeral":true`))
+	if rec.Code != http.StatusAccepted || out["packet_id"] != id {
 		t.Fatalf("explicit packet_id not echoed: %d %v", rec.Code, out)
 	}
 	last := fr.routed[len(fr.routed)-1]
-	if hex.EncodeToString(last.ID[:]) != id || string(last.Payload) != "sealed" {
-		t.Fatalf("routed packet mismatch: id=%x payload=%q", last.ID, last.Payload)
+	if hex.EncodeToString(last.ID[:]) != id || string(last.Payload) != "sealed" || !last.Ephemeral {
+		t.Fatalf("routed packet mismatch: id=%x payload=%q ephemeral=%v", last.ID, last.Payload, last.Ephemeral)
 	}
 	if last.Timestamp <= 0 || time.Since(time.UnixMilli(last.Timestamp)) > time.Minute {
 		t.Fatalf("routed packet timestamp %d", last.Timestamp)
 	}
 
 	fr.err = errors.New("boom")
-	rec, _ = postSend(t, s, body(""))
+	rec, _ = postSend(t, s, session, body(""))
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("route error: status %d, want 500", rec.Code)
 	}
@@ -94,12 +92,12 @@ func TestHandleSendOutcomes(t *testing.T) {
 		`not json`,
 	}
 	for _, b := range bad {
-		rec, _ := postSend(t, s, b)
+		rec, _ := postSend(t, s, session, b)
 		if rec.Code != http.StatusBadRequest {
 			t.Fatalf("body %s: status %d, want 400", b, rec.Code)
 		}
 	}
-	rec, out = postSend(t, s, body(`,"pad":"`+strings.Repeat("a", config.DefaultLimits().MaxSendBodyBytes)+`"`))
+	rec, out = postSend(t, s, session, body(`,"pad":"`+strings.Repeat("a", config.DefaultLimits().MaxSendBodyBytes)+`"`))
 	if rec.Code != http.StatusRequestEntityTooLarge || out["code"] != "TOO_LARGE" {
 		t.Fatalf("oversized body: status %d body %v, want 413", rec.Code, out)
 	}
@@ -108,10 +106,26 @@ func TestHandleSendOutcomes(t *testing.T) {
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("GET /send: status %d", rec.Code)
 	}
+
+	routed := len(fr.routed)
+	rec, _ = postSend(t, s, "", body(""))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("missing session: status %d, want 401", rec.Code)
+	}
+	rec, _ = postSend(t, s, session, strings.Replace(body(""), sender, recipient, 1))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong sender: status %d, want 401", rec.Code)
+	}
+	_ = socket.Close()
+	waitUntil(t, "session removed", func() bool { return s.hub.count() == 0 })
+	rec, _ = postSend(t, s, session, body(""))
+	if rec.Code != http.StatusUnauthorized || len(fr.routed) != routed {
+		t.Fatalf("expired session: status %d, routed packets %d", rec.Code, len(fr.routed))
+	}
 }
 
-func TestHealthAndPeers(t *testing.T) {
-	s, fr, _ := newTestServer(t, &config.Config{NetworkMode: config.ModePublic})
+func TestHealthAndRemovedPeersEndpoint(t *testing.T) {
+	s, _, _ := newTestServer(t, &config.Config{NetworkMode: config.ModePublic})
 	rec := httptest.NewRecorder()
 	s.handleHealth(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
 	if rec.Code != http.StatusOK {
@@ -125,16 +139,9 @@ func TestHealthAndPeers(t *testing.T) {
 		t.Fatalf("health body %v", health)
 	}
 
-	app := test.RandPeerIDFatal(t)
-	via := test.RandPeerIDFatal(t)
-	fr.router.Upsert(app, via, time.Hour)
 	rec = httptest.NewRecorder()
-	s.handlePeers(rec, httptest.NewRequest(http.MethodGet, "/peers", nil))
-	var peers []map[string]string
-	if err := json.Unmarshal(rec.Body.Bytes(), &peers); err != nil {
-		t.Fatal(err)
-	}
-	if len(peers) != 1 || peers[0]["peer_id"] != app.String() || peers[0]["via_node"] != via.String() {
-		t.Fatalf("peers body %v", peers)
+	s.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/peers", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("peers status %d, want 404", rec.Code)
 	}
 }

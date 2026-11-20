@@ -98,15 +98,15 @@ network_mode: "private"
 psk_path: "./network.psk"
 bootstrap_peers:
   - "/ip4/<this-node's-lan-or-public-ip>/tcp/4001/p2p/<this-node's-peer-id>"
-api_host: "0.0.0.0"
+api_host: "127.0.0.1"
 api_token: "<a long random secret>"
 ```
 
 `bootstrap_peers` must have at least one entry in private mode. On the first and only node of a network, list the node's own address: its peer ID is logged at startup on the `node identity` line as `peer_id=12D3Koo...`, and the self-dial is skipped harmlessly. Later nodes list the first node instead.
 
-`api_host: "0.0.0.0"` lets apps on other machines reach the API. `api_token` gates every endpoint, so set the same token in each app. A token is honoured on `private` and `custom_public` networks only. On a `public` node it is stripped and rewritten to `""` on load, with a log line saying so, because apps on the default network have no token and setting one there locks every one of them out.
+Keep the API on loopback and publish it through the [HTTPS setup](#https-setup). Set the same `api_token` in each app. Only `private` and `custom_public` networks use this shared token.
 
-**3. Point the apps at it.** In the Plural Star app, open Network Settings and enter the node's URL (for example `http://192.168.1.20:7523`) as the Relay URL, plus the token. Every app on the network does the same.
+**3. Point the apps at it.** In Plural Star's Network Settings, set the Relay URL to your HTTPS hostname (for example `https://node.example.com`) and enter the token.
 
 **4. Add a second node (optional).** On the running node:
 
@@ -122,7 +122,7 @@ curl -X POST -H "Content-Type: application/json" -d '{"invite":"<the invite stri
 
 That writes the PSK and bootstrap address into the new node's config. Restart it.
 
-**Private networks run TCP-only.** go-libp2p's QUIC transport does not support private networks, so the QUIC listen address is dropped automatically when a PSK is set. Forward **TCP 4001** between nodes, and **TCP 7523** if apps connect from outside the LAN. Set `announce_addrs` to the node's reachable address if it sits behind NAT.
+**Private networks run TCP-only.** go-libp2p's QUIC transport does not support private networks, so the QUIC listen address is dropped automatically when a PSK is set. Forward **TCP 4001** between nodes and **TCP 443** to the HTTPS reverse proxy for apps. Set `announce_addrs` to the node's reachable address if it sits behind NAT.
 
 ### Cloud services on a private network
 
@@ -151,7 +151,7 @@ See `config.yaml.example`. Key fields:
 | `network_id` | namespacing string (required for `custom_public`) |
 | `bootstrap_peers` | multiaddr list; required for `private` and `custom_public`, built-in defaults for `public` |
 | `directory_url` | optional hosted directory of signed network cards (`public` / `custom_public`) |
-| `api_host` | API bind address; `127.0.0.1` (default, local only) or `0.0.0.0` to allow apps to connect over the network |
+| `api_host` | API bind address, defaulting to `127.0.0.1` for a same-host HTTPS reverse proxy |
 | `api_port` / `api_token` | API port and bearer token (`private` / `custom_public` only) |
 | `listen_addrs` / `announce_addrs` | libp2p listen multiaddrs, and the external address to advertise behind NAT |
 | `relay_enabled` | whether this node forwards traffic for others |
@@ -169,25 +169,42 @@ Paths: `keypair_path` and `psk_path` resolve against the process working directo
 - **Private**: PSK-enforced via libp2p `pnet`. No DHT or public discovery; bootstrap peers must be specified. TCP-only.
 - **Custom public**: open join scoped under `plural-star/<network_id>`, separate from the global network.
 
+## HTTPS setup
+
+Point your hostname's DNS records at the server. With deSEC, keep the hostname there and terminate TLS on the server's reverse proxy. This example uses Caddy on the same host as the node:
+
+```caddyfile
+node.example.com {
+    @app path /health /nodes /networks /send /ws /rendezvous/* /cloud/*
+    reverse_proxy @app 127.0.0.1:7523
+    respond 404
+}
+```
+
+Allow inbound TCP 443 (HTTPS and WebSocket upgrades) and TCP 80 for Caddy's HTTP redirect and certificate validation. Keep TCP 7523 internal and access `/config` and `/invite/*` locally. If you run a separate push gateway, keep its `/gw/*` proxy route pointed at that service.
+
+Deploy this node alongside an app build that supports signed relay sessions. Older clients need to update before they can connect.
+
 ## API
 
-When `api_token` is set, all endpoints require `Authorization: Bearer <api_token>` (WebSocket clients may instead pass `?token=<api_token>`). On a public node the token is always empty and every endpoint is open.
+When `api_token` is set, relay requests and WebSocket upgrades require `Authorization: Bearer <api_token>`. Public nodes use signed relay sessions without a shared API token.
 
 | Method | Path | Description |
 |---|---|---|
 | GET | `/health` | Status, peer ID, mode, network ID, connected node/app counts, uptime, `roles`, `agent`, `version`, `pressure`, and a `cloud` block when the cloud role is on |
 | GET | `/nodes` | Connected libp2p nodes with RTT and roles |
-| GET | `/peers` | Known online app peers (from the routing table) |
 | GET | `/networks` | Known public networks (from the discovery cache) |
-| POST | `/send` | Send a packet: `{sender_peer_id, recipient_peer_id, payload(base64), packet_id?}` → `{status, packet_id}`. `status` says what the node did: `delivered` (an app with that peer id is connected to this node; 200), `forwarded` (handed to the recipient's node; 202), `held` (no route right now, kept for later delivery; 202) or `duplicate` (this `packet_id` was routed before; 200). Reuse the returned `packet_id` when sending the same packet through other nodes so duplicates are deduped end-to-end |
+| POST | `/send` | Send a packet with `X-Relay-Session` and `{sender_peer_id, recipient_peer_id, payload, packet_id?, ephemeral?}`. The payload is base64. Returns HTTP 202 with `{status: "queued", packet_id}` for each accepted packet regardless of routing outcome. Reuse an explicit packet ID when sending the same packet through other nodes. Set `ephemeral` for packets that should be dropped when there is no route. |
 | POST | `/invite/generate` | Generate a private-network invite (private mode only). Operator only: needs the `api_token`, or a caller on the local machine when none is set |
 | POST | `/invite/accept` | Accept an invite; writes PSK + bootstrap, requires restart. Operator only (as above) and the body must be sent as `application/json` |
 | GET | `/config` | Current config (secrets redacted). Operator only (as above) |
 | POST | `/rendezvous/register` | Publish a signed, short-lived pairing record under a namespace |
 | GET | `/rendezvous/lookup` | Look up pairing records: `?namespace=<ns>` |
-| GET | `/ws` | WebSocket; pass `?peer_id=<app peer id>` to register |
+| GET | `/ws` | WebSocket with `?peer_id=<app peer id>` and the signed handshake below |
 
-WebSocket events (node → app), each a JSON object with a `type`: `packet_received`, `peer_online`, `peer_offline`, `node_connected`, `node_disconnected`.
+The node sends `{type: "auth_challenge", nonce}`. The app signs the UTF-8 string `plural-star:relay-auth:v1:` followed by the nonce with its PeerID private key and sends `{type: "auth_response", signature}` with a base64 signature. The node replies with `{type: "auth_ready", session}`. Use that session only while this WebSocket is open.
+
+After authentication, the node sends JSON events of type `packet_received`, `node_connected`, or `node_disconnected`.
 
 With the cloud role on, `/cloud/*` is added: `vault/lookup`, `vault/create`, `vault/info`, `vault/manifest`, `vault/objects/{id}`, `vault/devices`, `vault/rewrap`, `inbox`, `front/{peer_id}`, `push/register`, `push/event`, and `blob/*` on a node that serves its blob store to another node. The `blob/*` routes are authenticated with `cloud.blob_serve_secret` instead of `api_token`, and exist only when that secret is set.
 

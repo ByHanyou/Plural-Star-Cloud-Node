@@ -22,6 +22,7 @@ func TestPacketRoundTrip(t *testing.T) {
 		RecipientID: []byte("recipient"),
 		Payload:     []byte("opaque encrypted blob"),
 		Timestamp:   time.Now().UnixMilli(),
+		Ephemeral:   true,
 	}
 	b, err := orig.Marshal()
 	if err != nil {
@@ -32,9 +33,17 @@ func TestPacketRoundTrip(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	if got.ID != orig.ID || string(got.Payload) != string(orig.Payload) ||
-		string(got.RecipientID) != string(orig.RecipientID) || got.Timestamp != orig.Timestamp {
+		string(got.RecipientID) != string(orig.RecipientID) || got.Timestamp != orig.Timestamp || got.Ephemeral != orig.Ephemeral {
 		t.Fatalf("round-trip mismatch: got %+v want %+v", got, orig)
 	}
+}
+
+func TestEphemeralPacketSkipsOfflineStorage(t *testing.T) {
+	m := &Manager{offline: func(peer.ID, *Packet) bool {
+		t.Fatal("ephemeral packet reached offline storage")
+		return false
+	}}
+	m.hold(test.RandPeerIDFatal(t), &Packet{Ephemeral: true})
 }
 
 func TestDedupSeenOrAdd(t *testing.T) {

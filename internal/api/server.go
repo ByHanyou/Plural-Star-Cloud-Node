@@ -28,7 +28,6 @@ import (
 
 type Relay interface {
 	Route(*relay.Packet) (relay.Outcome, error)
-	Router() *relay.Router
 	AppConnected(peer.ID, relay.DeliverFunc)
 	AppDisconnected(peer.ID)
 }
@@ -52,6 +51,7 @@ type Server struct {
 	cfgMu      sync.RWMutex
 	cfg        *config.Config
 	inviteMu   sync.Mutex
+	appMu      sync.Mutex
 	configPath string
 	h          host.Host
 	hub        *Hub
@@ -142,7 +142,6 @@ func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.authed(s.handleHealth))
 	mux.HandleFunc("/nodes", s.authed(s.handleNodes))
-	mux.HandleFunc("/peers", s.authed(s.handlePeers))
 	mux.HandleFunc("/networks", s.authed(s.handleNetworks))
 	mux.HandleFunc("/send", s.authed(s.handleSend))
 	mux.HandleFunc("/invite/generate", s.authed(s.handleInviteGenerate))

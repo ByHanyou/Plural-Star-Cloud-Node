@@ -2,17 +2,6 @@
 
 package api
 
-type peerOnlineEvent struct {
-	Type    string `json:"type"`
-	PeerID  string `json:"peer_id"`
-	ViaNode string `json:"via_node"`
-}
-
-type peerOfflineEvent struct {
-	Type   string `json:"type"`
-	PeerID string `json:"peer_id"`
-}
-
 type nodeConnectedEvent struct {
 	Type       string `json:"type"`
 	NodePeerID string `json:"node_peer_id"`

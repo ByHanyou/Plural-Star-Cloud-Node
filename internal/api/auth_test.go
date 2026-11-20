@@ -28,11 +28,8 @@ func TestCheckAuth(t *testing.T) {
 	if s.checkAuth(r) {
 		t.Fatal("wrong bearer token accepted")
 	}
-	if !s.checkAuth(httptest.NewRequest(http.MethodGet, "/ws?token=secret", nil)) {
-		t.Fatal("query token refused")
-	}
-	if s.checkAuth(httptest.NewRequest(http.MethodGet, "/ws?token=wrong", nil)) {
-		t.Fatal("wrong query token accepted")
+	if s.checkAuth(httptest.NewRequest(http.MethodGet, "/ws?token=secret", nil)) {
+		t.Fatal("query token accepted")
 	}
 }
 

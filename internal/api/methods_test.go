@@ -15,7 +15,6 @@ func TestReadEndpointsRejectOtherMethods(t *testing.T) {
 	handlers := map[string]http.HandlerFunc{
 		"/health":   s.handleHealth,
 		"/nodes":    s.handleNodes,
-		"/peers":    s.handlePeers,
 		"/networks": s.handleNetworks,
 		"/config":   s.handleConfig,
 	}

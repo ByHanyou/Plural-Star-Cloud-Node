@@ -12,19 +12,23 @@ import (
 type Hub struct {
 	mu       sync.RWMutex
 	clients  map[*wsClient]struct{}
+	sessions map[string]*wsClient
 	reserved int
+	closed   bool
 }
 
 func NewHub() *Hub {
-	return &Hub{clients: make(map[*wsClient]struct{})}
+	return &Hub{
+		clients:  make(map[*wsClient]struct{}),
+		sessions: make(map[string]*wsClient),
+	}
 }
 
-func (h *Hub) OnAppPeerEvent(peerID, viaNode peer.ID, online bool) {
-	if online {
-		h.broadcast(peerOnlineEvent{Type: "peer_online", PeerID: peerID.String(), ViaNode: viaNode.String()})
-	} else {
-		h.broadcast(peerOfflineEvent{Type: "peer_offline", PeerID: peerID.String()})
-	}
+func (h *Hub) ownsSession(session string, appPeer peer.ID) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	client := h.sessions[session]
+	return client != nil && client.appPeer == appPeer
 }
 
 func (h *Hub) OnNodeEvent(peerID peer.ID, rttMs int64, connected bool) {
@@ -64,7 +68,7 @@ func (h *Hub) sendToApp(appPeer peer.ID, ev any) {
 func (h *Hub) reserve(max int) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if max > 0 && len(h.clients)+h.reserved >= max {
+	if h.closed || (max > 0 && len(h.clients)+h.reserved >= max) {
 		return false
 	}
 	h.reserved++
@@ -79,18 +83,24 @@ func (h *Hub) release() {
 	h.mu.Unlock()
 }
 
-func (h *Hub) add(c *wsClient) {
+func (h *Hub) add(c *wsClient) bool {
 	h.mu.Lock()
-	h.clients[c] = struct{}{}
+	defer h.mu.Unlock()
 	if h.reserved > 0 {
 		h.reserved--
 	}
-	h.mu.Unlock()
+	if h.closed {
+		return false
+	}
+	h.clients[c] = struct{}{}
+	h.sessions[c.session] = c
+	return true
 }
 
 func (h *Hub) remove(c *wsClient) {
 	h.mu.Lock()
 	delete(h.clients, c)
+	delete(h.sessions, c.session)
 	h.mu.Unlock()
 }
 
@@ -111,26 +121,14 @@ func (h *Hub) count() int {
 	return len(h.clients)
 }
 
-func (h *Hub) appPeers() []peer.ID {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	seen := make(map[peer.ID]struct{}, len(h.clients))
-	out := make([]peer.ID, 0, len(h.clients))
-	for c := range h.clients {
-		if _, dup := seen[c.appPeer]; dup {
-			continue
-		}
-		seen[c.appPeer] = struct{}{}
-		out = append(out, c.appPeer)
-	}
-	return out
-}
-
 func (h *Hub) closeAll() {
 	h.mu.Lock()
+	h.closed = true
 	for c := range h.clients {
 		c.close()
+		_ = c.conn.Close()
 	}
-	h.clients = make(map[*wsClient]struct{})
+	clear(h.clients)
+	clear(h.sessions)
 	h.mu.Unlock()
 }

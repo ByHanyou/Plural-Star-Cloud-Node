@@ -155,7 +155,7 @@ func run(configPath string) error {
 
 	pingMgr := ping.NewManager(ctx, h, lim.PingTimeout.Std(), hub.OnNodeEvent)
 
-	mgr, rErr := relay.NewManager(ctx, h, ps, network.GossipPrefix(cfg), lim, hub.OnAppPeerEvent)
+	mgr, rErr := relay.NewManager(ctx, h, ps, network.GossipPrefix(cfg), lim, nil)
 	if rErr != nil {
 		return fmt.Errorf("relay manager: %w", rErr)
 	}

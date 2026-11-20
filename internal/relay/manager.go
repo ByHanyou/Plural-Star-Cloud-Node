@@ -107,6 +107,9 @@ func (m *Manager) SetOfflineReplay(f OfflineReplayFunc) {
 }
 
 func (m *Manager) hold(recipient peer.ID, p *Packet) {
+	if p.Ephemeral {
+		return
+	}
 	m.offlineMu.RLock()
 	f := m.offline
 	m.offlineMu.RUnlock()

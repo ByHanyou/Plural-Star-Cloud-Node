@@ -75,11 +75,6 @@ func (s *Server) checkAuth(r *http.Request) bool {
 			return true
 		}
 	}
-	if q := r.URL.Query().Get("token"); q != "" {
-		if subtle.ConstantTimeCompare([]byte(q), want) == 1 {
-			return true
-		}
-	}
 	return false
 }
 

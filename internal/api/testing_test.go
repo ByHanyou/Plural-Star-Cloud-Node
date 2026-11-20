@@ -27,15 +27,13 @@ type fakeRelay struct {
 	outcome  relay.Outcome
 	err      error
 	routed   []*relay.Packet
-	router   *relay.Router
 	delivers map[peer.ID]relay.DeliverFunc
 	gone     []peer.ID
 }
 
-func newFakeRelay(ctx context.Context) *fakeRelay {
+func newFakeRelay() *fakeRelay {
 	return &fakeRelay{
 		outcome:  relay.OutcomeDelivered,
-		router:   relay.NewRouter(ctx, time.Hour),
 		delivers: make(map[peer.ID]relay.DeliverFunc),
 	}
 }
@@ -46,8 +44,6 @@ func (f *fakeRelay) Route(p *relay.Packet) (relay.Outcome, error) {
 	f.routed = append(f.routed, p)
 	return f.outcome, f.err
 }
-
-func (f *fakeRelay) Router() *relay.Router { return f.router }
 
 func (f *fakeRelay) AppConnected(p peer.ID, deliver relay.DeliverFunc) {
 	f.mu.Lock()
@@ -88,7 +84,7 @@ func newTestServer(t *testing.T, cfg *config.Config) (*Server, *fakeRelay, strin
 	if cfg.Limits == (config.Limits{}) {
 		cfg.Limits = config.DefaultLimits()
 	}
-	fr := newFakeRelay(ctx)
+	fr := newFakeRelay()
 	srv, err := New(cfg, configPath, h, Deps{
 		Hub:        NewHub(),
 		Rendezvous: NewRendezvousStore(ctx, configPath, cfg.Limits),

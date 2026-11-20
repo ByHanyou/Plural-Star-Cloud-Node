@@ -62,41 +62,6 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.ping.Nodes())
 }
 
-func (s *Server) handlePeers(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	seen := make(map[string]struct{})
-	out := make([]map[string]string, 0)
-
-	self := s.h.ID().String()
-	for _, p := range s.hub.appPeers() {
-		id := p.String()
-		if _, dup := seen[id]; dup {
-			continue
-		}
-		seen[id] = struct{}{}
-		out = append(out, map[string]string{
-			"peer_id":  id,
-			"via_node": self,
-		})
-	}
-
-	for _, pr := range s.relay.Router().Snapshot() {
-		id := pr.Peer.String()
-		if _, dup := seen[id]; dup {
-			continue
-		}
-		seen[id] = struct{}{}
-		out = append(out, map[string]string{
-			"peer_id":  id,
-			"via_node": pr.Via.String(),
-		})
-	}
-	writeJSON(w, http.StatusOK, out)
-}
-
 func (s *Server) handleNetworks(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -124,6 +89,7 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		Recipient string `json:"recipient_peer_id"`
 		Payload   string `json:"payload"`
 		PacketID  string `json:"packet_id,omitempty"`
+		Ephemeral bool   `json:"ephemeral,omitempty"`
 	}
 	if !decodeJSON(w, r, s.config().Limits.MaxSendBodyBytes, &req) {
 		return
@@ -164,26 +130,27 @@ func (s *Server) handleSend(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid sender_peer_id")
 		return
 	}
+	if !s.hub.ownsSession(r.Header.Get("X-Relay-Session"), sender) {
+		writeError(w, http.StatusUnauthorized, "authenticated sender session required")
+		return
+	}
 	pkt := &relay.Packet{
 		ID:          id,
 		SenderID:    []byte(sender),
 		RecipientID: []byte(recipient),
 		Payload:     payload,
 		Timestamp:   time.Now().UnixMilli(),
+		Ephemeral:   req.Ephemeral,
 	}
 
-	outcome, err := s.relay.Route(pkt)
+	_, err = s.relay.Route(pkt)
 	if err != nil {
 		slog.Warn("api: send failed", "from", sender, "to", recipient, "err", err)
 		writeError(w, http.StatusInternalServerError, "could not route packet")
 		return
 	}
-	status := http.StatusOK
-	if outcome == relay.OutcomeForwarded || outcome == relay.OutcomeHeld {
-		status = http.StatusAccepted
-	}
-	writeJSON(w, status, map[string]string{
-		"status":    string(outcome),
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"status":    "queued",
 		"packet_id": hex.EncodeToString(id[:]),
 	})
 }
@@ -226,6 +193,11 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing or invalid peer_id query parameter")
 		return
 	}
+	key, err := appPeer.ExtractPublicKey()
+	if err != nil || key == nil {
+		writeError(w, http.StatusBadRequest, "peer_id must embed its public key")
+		return
+	}
 	cfg := s.config()
 	if !s.hub.reserve(cfg.MaxAppConnections) {
 		writeError(w, http.StatusServiceUnavailable, "max_app_connections reached")
@@ -238,14 +210,45 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := newWSClient(conn, appPeer, cfg.Limits)
-	s.hub.add(client)
+	defer conn.Close()
 
-	s.hub.OnAppPeerEvent(appPeer, s.h.ID(), true)
+	session, err := authenticateWS(conn, key, cfg.Limits.WSWriteWait.Std())
+	if err != nil {
+		s.hub.release()
+		return
+	}
 
-	s.relay.AppConnected(appPeer, func(p *relay.Packet) {
-		s.hub.sendToApp(appPeer, packetEvent(p))
-	})
+	client := newWSClient(conn, appPeer, session, cfg.Limits)
+
+	s.appMu.Lock()
+	first := !s.hub.hasClientFor(appPeer)
+	if !s.hub.add(client) {
+		s.appMu.Unlock()
+		return
+	}
+	if first {
+		s.relay.AppConnected(appPeer, func(p *relay.Packet) {
+			s.hub.sendToApp(appPeer, packetEvent(p))
+		})
+	}
+	s.appMu.Unlock()
+
+	defer func() {
+		s.appMu.Lock()
+		defer s.appMu.Unlock()
+		s.hub.remove(client)
+		client.close()
+		if !s.hub.hasClientFor(appPeer) {
+			s.relay.AppDisconnected(appPeer)
+		}
+	}()
+
+	if err := conn.SetWriteDeadline(time.Now().Add(cfg.Limits.WSWriteWait.Std())); err != nil {
+		return
+	}
+	if err := conn.WriteJSON(wsAuthMessage{Type: "auth_ready", Session: session}); err != nil {
+		return
+	}
 
 	if s.cloud != nil {
 		replayed := s.cloud.Inbox().Replay(appPeer, func(p *relay.Packet) bool {
@@ -262,14 +265,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	go client.writePump()
-	client.readPump(func() {
-		s.hub.remove(client)
-		client.close()
-		if !s.hub.hasClientFor(appPeer) {
-			s.relay.AppDisconnected(appPeer)
-			s.hub.OnAppPeerEvent(appPeer, s.h.ID(), false)
-		}
-	})
+	client.readPump()
 }
 
 func (s *Server) handleInviteGenerate(w http.ResponseWriter, r *http.Request) {
